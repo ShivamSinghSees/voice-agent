@@ -39,10 +39,10 @@ curl -X POST http://localhost:8000/agents \
     "name": "Custom Support Agent",
     "system_prompt": "You are a customer service assistant. Greet the customer and inform them this call is recorded.",
     "voice": "aura-asteria-en",
-    "model": "llama-3.3-70b-versatile"
+    "model": "qwen/qwen3.8-27b"
   }'
 ```
-> **Note on Voice / Model IDs**: `aura-asteria-en` and `llama-3.3-70b-versatile` are UNVERIFIED in the agent worker pipeline; they will be re-checked against installed livekit-plugins in Phase 3.
+> **Note on Voice / Model IDs**: `aura-asteria-en` (Deepgram) and `qwen/qwen3.8-27b` (Groq, ~182ms TTFT) are verified and active in the agent worker pipeline.
 
 #### List Agents (`GET /agents`)
 ```bash

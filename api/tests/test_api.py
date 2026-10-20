@@ -3,6 +3,7 @@
 Mocks LiveKit interactions to isolate backend logic, permission gates, and idempotency.
 """
 
+import json
 from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi.testclient import TestClient
@@ -245,3 +246,150 @@ def test_livekit_failure_returns_502_and_marks_call_failed(mock_livekit, client)
     calls = storage.list_calls(config.DATABASE_PATH)
     assert len(calls) == 1
     assert calls[0]["status"] == "failed"
+
+
+@pytest.mark.anyio
+async def test_create_room_and_dispatch_deduplication():
+    """Verify create_room_and_dispatch sets CreateRoomRequest.agents atomically
+
+    with agent_name="support-agent", preventing duplicate dispatch registrations.
+    """
+    from unittest.mock import MagicMock
+    from app.livekit_service import create_room_and_dispatch
+
+    mock_lkapi = MagicMock()
+    mock_lkapi.room.create_room = AsyncMock()
+    mock_lkapi.aclose = AsyncMock()
+
+    with patch("app.livekit_service.get_livekit_api", return_value=mock_lkapi):
+        token = await create_room_and_dispatch("test-room", "c1", "a1")
+        assert token is not None
+
+        # Verify CreateRoomRequest has agents populated atomically
+        call_args = mock_lkapi.room.create_room.call_args[0][0]
+        assert call_args.name == "test-room"
+        assert call_args.empty_timeout == 60
+        assert len(call_args.agents) == 1
+        assert call_args.agents[0].agent_name == "support-agent"
+        assert json.loads(call_args.agents[0].metadata) == {"call_id": "c1", "agent_id": "a1"}
+
+
+def _seed_call(call_id: str) -> dict:
+    """Insert an agent + call directly via storage (calls.agent_id has a FOREIGN KEY to agents.id)."""
+    agent_id = f"agent-for-{call_id}"
+    storage.create_agent(
+        db_path=config.DATABASE_PATH,
+        agent_id=agent_id,
+        name="Seed Agent",
+        system_prompt="Test prompt",
+        voice="aura-asteria-en",
+        model="qwen/qwen3.8-27b",
+        created_at="2026-10-20T09:58:00Z",
+    )
+    return storage.create_call(
+        config.DATABASE_PATH,
+        call_id=call_id,
+        agent_id=agent_id,
+        room_name=f"room-{call_id}",
+        created_at="2026-10-20T09:59:00Z",
+    )
+
+
+def test_internal_endpoints_require_token(client):
+    """Verify that all internal endpoints return HTTP 401 on missing or incorrect X-Internal-Token."""
+    # Seed a call directly in DB
+    call = _seed_call("test-auth-call")
+
+    # 1. POST /internal/calls/{id}/started without token -> 401
+    resp = client.post(f"/internal/calls/{call['id']}/started", json={"started_at": "2026-10-20T10:00:00Z"})
+    assert resp.status_code == 401
+    assert resp.json()["detail"].startswith("Unauthorized")
+
+    # 2. POST /internal/calls/{id}/started with invalid token -> 401
+    resp = client.post(
+        f"/internal/calls/{call['id']}/started",
+        headers={"X-Internal-Token": "bad-token-value"},
+        json={"started_at": "2026-10-20T10:00:00Z"},
+    )
+    assert resp.status_code == 401
+
+    # 3. POST /internal/calls/{id}/transcript with invalid token -> 401
+    resp = client.post(
+        f"/internal/calls/{call['id']}/transcript",
+        headers={"X-Internal-Token": "bad-token-value"},
+        json={"lines": []},
+    )
+    assert resp.status_code == 401
+
+    # 4. POST /internal/calls/{id}/ended with invalid token -> 401
+    resp = client.post(
+        f"/internal/calls/{call['id']}/ended",
+        headers={"X-Internal-Token": "bad-token-value"},
+        json={"ended_at": "2026-10-20T10:05:00Z"},
+    )
+    assert resp.status_code == 401
+
+
+def test_transcript_upsert_idempotency(client):
+    """Verify that posting transcript lines with identical seq updates existing rows rather than duplicating."""
+    call = _seed_call("test-idem-call")
+    headers = {"X-Internal-Token": config.INTERNAL_API_TOKEN}
+
+    # First upsert: seq 0
+    resp1 = client.post(
+        f"/internal/calls/{call['id']}/transcript",
+        headers=headers,
+        json={"lines": [{"seq": 0, "speaker": "agent", "text": "Original greeting", "started_at": "2026-10-20T10:00:00Z", "ended_at": "2026-10-20T10:00:02Z"}]},
+    )
+    assert resp1.status_code == 200
+
+    # Second upsert: seq 0 with corrected text (barge-in truncation or correction)
+    resp2 = client.post(
+        f"/internal/calls/{call['id']}/transcript",
+        headers=headers,
+        json={"lines": [{"seq": 0, "speaker": "agent", "text": "Corrected greeting text", "started_at": "2026-10-20T10:00:00Z", "ended_at": "2026-10-20T10:00:03Z"}]},
+    )
+    assert resp2.status_code == 200
+
+    # End call and verify exactly 1 transcript line exists with updated text
+    client.post(f"/internal/calls/{call['id']}/ended", headers=headers, json={"ended_at": "2026-10-20T10:01:00Z"})
+    call_resp = client.get(f"/calls/{call['id']}")
+    assert call_resp.status_code == 200
+    tx = call_resp.json()["transcript"]
+    assert len(tx) == 1
+    assert tx[0]["seq"] == 0
+    assert tx[0]["text"] == "Corrected greeting text"
+
+
+def test_transcript_gated_until_call_ended(client):
+    """Verify that GET /calls/{id} transcript field remains null during 'created' and 'active' states,
+
+    and is only revealed once the call transitions to 'ended'.
+    """
+    call = _seed_call("test-gate-call")
+    headers = {"X-Internal-Token": config.INTERNAL_API_TOKEN}
+
+    # 1. In 'created' state -> transcript must be None
+    assert client.get(f"/calls/{call['id']}").json()["transcript"] is None
+
+    # 2. Worker marks started -> status 'active' -> transcript must STILL be None
+    client.post(f"/internal/calls/{call['id']}/started", headers=headers, json={"started_at": "2026-10-20T10:00:00Z"})
+    assert client.get(f"/calls/{call['id']}").json()["status"] == "active"
+    assert client.get(f"/calls/{call['id']}").json()["transcript"] is None
+
+    # 3. Worker streams transcript rows while call is active -> transcript must STILL be None
+    client.post(
+        f"/internal/calls/{call['id']}/transcript",
+        headers=headers,
+        json={"lines": [{"seq": 0, "speaker": "agent", "text": "In progress speech", "started_at": "2026-10-20T10:00:01Z", "ended_at": "2026-10-20T10:00:04Z"}]},
+    )
+    assert client.get(f"/calls/{call['id']}").json()["transcript"] is None
+
+    # 4. Worker marks call ended -> transcript is finally un-gated
+    client.post(f"/internal/calls/{call['id']}/ended", headers=headers, json={"ended_at": "2026-10-20T10:00:10Z"})
+    ended_call = client.get(f"/calls/{call['id']}").json()
+    assert ended_call["status"] == "ended"
+    assert ended_call["transcript"] is not None
+    assert len(ended_call["transcript"]) == 1
+    assert ended_call["transcript"][0]["text"] == "In progress speech"
+

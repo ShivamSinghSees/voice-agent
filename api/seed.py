@@ -50,8 +50,8 @@ def seed_demo_agent(db_path: str = config.DATABASE_PATH) -> dict:
         agent_id=agent_id,
         name="Acme Telecom Support",
         system_prompt=system_prompt,
-        voice="aura-asteria-en",  # UNVERIFIED, re-check against the installed livekit-plugins in Phase 3
-        model="llama-3.3-70b-versatile",  # UNVERIFIED, re-check against the installed livekit-plugins in Phase 3
+        voice="aura-asteria-en",  # VERIFIED in livekit.plugins.deepgram.models.TTSModels
+        model="qwen/qwen3.8-27b",  # VERIFIED lowest latency (~182ms TTFT) against live Groq API
         created_at=now_iso,
     )
     print(f"Created demo agent: {agent['name']} (ID: {agent['id']})")

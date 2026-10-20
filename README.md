@@ -64,6 +64,28 @@ On startup, SQLite tables are created automatically and the demo agent "Acme Tel
 uv --directory api run pytest
 ```
 
+### 6. Setup & Start Agent Worker
+Pre-download the Silero VAD and turn detection neural models:
+```bash
+uv --directory agent run python -m livekit.agents download-files
+```
+
+Start the Python LiveKit Agent worker:
+```bash
+# Registers worker for explicit job dispatches matching agent_name="support-agent"
+uv --directory agent run python agent.py start
+```
+*(Use `python agent.py dev` during development for auto-reload).*
+
+### 7. Run Agent Unit & End-to-End Tests
+```bash
+# Run agent unit tests (truncation simulation, live Groq text pipeline)
+uv --directory agent run pytest
+
+# Run end-to-end race condition test (verifies customer pre-join and call lifecycle)
+uv --directory agent run python scripts/test_race_condition.py
+```
+
 ---
 
 ## Architecture
@@ -84,7 +106,15 @@ The project maintains strict component separation:
    - Provisions LiveKit rooms with `empty_timeout=60` and explicit agent dispatches (`agent_name="support-agent"`).
    - Issues restricted customer access tokens (audio mic publish only, no whisper publish).
    - Exposes internal token-protected endpoints for worker notifications (`started`, `transcript`, `ended`).
-2. **`agent/` (LiveKit Worker)**: Runs STT -> LLM -> TTS pipeline (Phase 3).
+2. **`agent/` (LiveKit Worker)**:
+   - Subscribes to explicit room dispatches (`agent_name="support-agent"`).
+   - Assembles pipeline: Deepgram STT (`nova-3`), Groq LLM (`qwen/qwen3.8-27b`), Deepgram TTS (`aura-asteria-en`), Silero VAD, and LiveKit Turn Detector.
+   - Isolates customer audio via `RoomOptions(participant_identity=customer_identity, close_on_disconnect=True)`.
+   - Discovers pre-connected participants to eliminate race conditions if customer joins before worker starts.
+   - Captures customer's server-side join time (`participant.joined_at`) and logs worker detection latency.
+   - Uses `JobExecutorType.THREAD` on macOS Apple Silicon to avoid process-spawn pickling overhead.
+   - Tracks interruptions using a custom `TrackingLLM` wrapper, logging both full LLM-generated text and kept synchronized text (`[INTERRUPTION_DEBUG]`).
+   - Synchronizes final call transcripts to the FastAPI backend via `POST /internal/calls/{id}/transcript` and triggers `POST /internal/calls/{id}/ended`.
 3. **`web/` (React Client)**: Customer call interface and operator whisper view (Phase 5).
 4. **`infra/` (LiveKit Server)**: Local Docker Compose deployment on macOS.
 
@@ -171,7 +201,8 @@ curl http://localhost:8000/calls/<call_id>
 
 - **No Authentication on Public Endpoints**: In this proof of concept, `/agents` and `/calls` endpoints are unauthenticated. Production requires OAuth/JWT session authentication and tenant separation.
 - **Abandoned Calls Remain in "created"**: If a customer requests a call via `POST /calls` but never opens the WebRTC connection, the database call record remains in `created` status indefinitely (even though LiveKit closes the room after `empty_timeout=60`). A background sweeper or webhook is required in production.
-- **Unverified Seed Voice & Model IDs**: Seed values (`model="llama-3.3-70b-versatile"`, `voice="aura-asteria-en"`) were verified from Groq/Deepgram documentation but remain UNVERIFIED against the installed livekit-plugins runtime until Phase 3.
+- **Barge-In Truncation Mechanics (Exact Audio vs. Estimated Words)**: When customer interrupts agent speech, LiveKit accurately stops playout at the exact millisecond sample position (`playback_position`). However, because Deepgram WebSocket TTS sends raw binary PCM without word boundary events, LiveKit estimates word-level transcript truncation using its internal `SpeakingRateDetector` and syllable pacing (`livekit.agents.voice.transcription.synchronizer`). Kept text is an estimated truncation rather than exact word timestamps.
+- **Thread Executor on macOS (No Process Isolation)**: The worker uses `JobExecutorType.THREAD` for local macOS development to avoid multiprocessing `spawn` pickling issues and eliminate process pool startup latency. Because jobs run in threads within a single Python process, there is no process isolation: one crashing job, uncaught fatal exception, or unyielding CPU-blocking call can affect other concurrent sessions on the worker. Production deployments must use process-per-job execution (`JobExecutorType.PROCESS`) on Linux hosts.
 - **Blocking SQLite in Async Handlers**: SQLite queries execute synchronously in FastAPI async route handlers. This is an accepted tradeoff for POC simplicity.
 - **Host-Bound Local Agent**: Setting `rtc.node_ip: 127.0.0.1` functions seamlessly when the agent worker and client browser run directly on the host machine. If the agent worker were containerized inside Docker, an internal service DNS name or bridge networking strategy would be required.
 - **Single UDP Port Muxing**: Muxing all media over `7882/udp` is optimal for development on macOS, but production high-scale deployments require the full `50000-60000/udp` range.

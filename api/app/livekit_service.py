@@ -58,31 +58,31 @@ async def create_room_and_dispatch(room_name: str, call_id: str, agent_id: str) 
             # Initialize LiveKit REST API client with configured server credentials
             lkapi = get_livekit_api()
 
-            # 1. Create Room with empty_timeout=60
+            dispatch_metadata = json.dumps({"call_id": call_id, "agent_id": agent_id})
+
+            # 1. Create Room with empty_timeout=60 and explicit agent dispatch
             # WHY empty_timeout=60: If a customer triggers call creation but closes the tab without joining,
             # or leaves prematurely, LiveKit automatically cleans up and terminates the room after 60 seconds
             # rather than leaving orphaned rooms and allocated media ports lingering on the SFU.
+            # WHY agents in CreateRoomRequest: Passing RoomAgentDispatch in CreateRoomRequest creates the
+            # explicit agent dispatch atomically at room creation. If CreateRoomRequest is called without
+            # agents, LiveKit server automatically registers an unassigned empty dispatch (agent_name=""),
+            # causing duplicate dispatches when create_dispatch is subsequently called.
             room_req = api.CreateRoomRequest(
                 name=room_name,
                 empty_timeout=60,
                 max_participants=5,
+                agents=[
+                    api.RoomAgentDispatch(
+                        agent_name=config.AGENT_NAME,
+                        metadata=dispatch_metadata,
+                    )
+                ],
             )
             # Timeout guard of 5.0 seconds prevents blocking backend event loop if LiveKit is down
             await asyncio.wait_for(lkapi.room.create_room(room_req), timeout=5.0)
 
-            # 2. Create Explicit Agent Dispatch
-            # WHY agent_name=config.AGENT_NAME: Explicit dispatch targets the specific registered worker pool
-            # ('support-agent') instead of relying on default auto-dispatch, fulfilling assignment requirements.
-            # WHY metadata: Serializes call_id and agent_id directly into the job dispatch payload,
-            # allowing the worker in Phase 3 to load the exact agent system prompt from DB without extra RPCs.
-            dispatch_req = api.CreateAgentDispatchRequest(
-                agent_name=config.AGENT_NAME,
-                room=room_name,
-                metadata=json.dumps({"call_id": call_id, "agent_id": agent_id}),
-            )
-            await asyncio.wait_for(lkapi.agent_dispatch.create_dispatch(dispatch_req), timeout=5.0)
-
-            # 3. Mint Customer AccessToken
+            # 2. Mint Customer AccessToken
             # WHY identity="customer-<call_id>": Uniquely attributes participant identity in server logs and WebRTC SDP.
             # WHY room=room_name: Scopes permissions strictly to this specific call room; cannot join any other room.
             # WHY can_publish=True & can_publish_sources=["microphone"]: Restricts media publish rights strictly to mic audio.
