@@ -30,10 +30,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("voice-worker")
 
-from livekit.agents.worker import JobExecutorType
-
-# Initialize AgentServer worker pool with thread executor
-server = AgentServer(job_executor_type=JobExecutorType.THREAD, num_idle_processes=1)
+# Initialize AgentServer worker pool with default process-per-job executor
+server = AgentServer()
 api_client = APIClient()
 
 
