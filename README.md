@@ -11,12 +11,12 @@ Proof-of-concept operator-guided voice AI agent built with a self-hosted LiveKit
 ### Prerequisites
 - macOS (Apple Silicon or Intel) or Linux
 - Docker Desktop or Docker Engine with Docker Compose v2+
-- Python 3.11+
+- Python 3.12 (managed via `uv`)
 - Node.js 20+
 - [`uv`](https://github.com/astral-sh/uv) (fast Python package and environment manager)
 
 ### 1. Environment Configuration
-Copy `.env.example` to `.env` and populate your secrets:
+Copy `.env.example` to `.env` and populate your credentials:
 ```bash
 cp .env.example .env
 ```
@@ -25,6 +25,11 @@ Ensure `.env` contains:
 LIVEKIT_URL=ws://localhost:7880
 LIVEKIT_API_KEY=your_generated_api_key
 LIVEKIT_API_SECRET=your_generated_api_secret
+DEEPGRAM_API_KEY=your_deepgram_api_key_here
+GROQ_API_KEY=your_groq_api_key_here
+DATABASE_PATH=./voice_agent.db
+INTERNAL_API_TOKEN=your_secure_internal_token_here
+CORS_ORIGINS=http://localhost:5173
 ```
 
 ### 2. Start Self-Hosted LiveKit Server
@@ -46,11 +51,87 @@ Run the verification script using `uv`:
 uv run --with livekit-api --with python-dotenv python3 infra/scripts/test_livekit_connection.py
 ```
 
+### 4. Start FastAPI Backend Service
+Navigate to the `api/` directory (or use `uv --directory api`):
+```bash
+# Start backend on http://localhost:8000
+uv --directory api run uvicorn app.main:app --port 8000
+```
+On startup, SQLite tables are created automatically and the demo agent "Acme Telecom Support" is seeded.
+
+### 5. Run Automated Backend Unit Tests
+```bash
+uv --directory api run pytest
+```
+
 ---
 
 ## Architecture
 
-*(To be expanded in Phase 2)*
+The project maintains strict component separation:
+
+```text
+[ React Web Client ]  <--- (REST: /agents, /calls) --->  [ FastAPI Backend (:8000) ]
+        |                                                              |
+   (WebRTC Audio)                                               (Room & Dispatch)
+        v                                                              v
+[ LiveKit Server (:7880) ] <--- (WebRTC Media & Data Channels) ---> [ Python Agent Worker ]
+```
+
+1. **`api/` (FastAPI + SQLite)**:
+   - Owns SQLite database access via `api/app/storage.py` (stdlib `sqlite3`, WAL mode, no ORM).
+   - Manages agent profiles and call records.
+   - Provisions LiveKit rooms with `empty_timeout=60` and explicit agent dispatches (`agent_name="support-agent"`).
+   - Issues restricted customer access tokens (audio mic publish only, no whisper publish).
+   - Exposes internal token-protected endpoints for worker notifications (`started`, `transcript`, `ended`).
+2. **`agent/` (LiveKit Worker)**: Runs STT -> LLM -> TTS pipeline (Phase 3).
+3. **`web/` (React Client)**: Customer call interface and operator whisper view (Phase 5).
+4. **`infra/` (LiveKit Server)**: Local Docker Compose deployment on macOS.
+
+---
+
+## API Endpoints & Curl Examples
+
+### Public Endpoints
+
+#### Create Agent (`POST /agents`)
+```bash
+curl -X POST http://localhost:8000/agents \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Custom Support Agent",
+    "system_prompt": "You are a customer service assistant. Greet the customer and inform them this call is recorded.",
+    "voice": "aura-asteria-en",
+    "model": "llama-3.3-70b-versatile"
+  }'
+```
+
+#### List Agents (`GET /agents`)
+```bash
+curl http://localhost:8000/agents
+```
+
+#### Start Call (`POST /calls`)
+```bash
+curl -X POST http://localhost:8000/calls \
+  -H "Content-Type: application/json" \
+  -d '{"agent_id": "<agent_id>"}'
+```
+Returns:
+```json
+{
+  "call_id": "5f84d691-...",
+  "room_name": "call-822a488e",
+  "token": "eyJhbGciOi...",
+  "livekit_url": "ws://localhost:7880"
+}
+```
+
+#### Get Call Status & Transcript (`GET /calls/{id}`)
+```bash
+curl http://localhost:8000/calls/<call_id>
+```
+*`transcript` is `null` while call is active or created. The transcript is exposed only after the call transitions to `ended`.*
 
 ---
 
@@ -77,7 +158,6 @@ uv run --with livekit-api --with python-dotenv python3 infra/scripts/test_liveki
 ### ICE Reachability Note
 - The local server advertises `127.0.0.1` on port `7882` (UDP) and `7881` (TCP).
 - A browser running on the macOS host connects directly to `localhost:7880` for signalling and sends media packets to `127.0.0.1:7882/udp`. Docker Desktop routes these packets to the container.
-- If testing from an external device on the local network (e.g. a mobile phone), `rtc.node_ip` in `infra/livekit.yaml` must be temporarily updated to the Mac host's LAN IP (e.g. `192.168.1.x`), and `.env` `LIVEKIT_URL` must point to that IP.
 
 ---
 
@@ -89,6 +169,10 @@ uv run --with livekit-api --with python-dotenv python3 infra/scripts/test_liveki
 
 ## Known limitations
 
+- **No Authentication on Public Endpoints**: In this proof of concept, `/agents` and `/calls` endpoints are unauthenticated. Production requires OAuth/JWT session authentication and tenant separation.
+- **Abandoned Calls Remain in "created"**: If a customer requests a call via `POST /calls` but never opens the WebRTC connection, the database call record remains in `created` status indefinitely (even though LiveKit closes the room after `empty_timeout=60`). A background sweeper or webhook is required in production.
+- **Unverified Seed Voice & Model IDs**: Seed values (`model="llama-3.3-70b-versatile"`, `voice="aura-asteria-en"`) were verified from Groq/Deepgram documentation but remain UNVERIFIED against the installed livekit-plugins runtime until Phase 3.
+- **Blocking SQLite in Async Handlers**: SQLite queries execute synchronously in FastAPI async route handlers. This is an accepted tradeoff for POC simplicity.
 - **Host-Bound Local Agent**: Setting `rtc.node_ip: 127.0.0.1` functions seamlessly when the agent worker and client browser run directly on the host machine. If the agent worker were containerized inside Docker, an internal service DNS name or bridge networking strategy would be required.
 - **Single UDP Port Muxing**: Muxing all media over `7882/udp` is optimal for development on macOS, but production high-scale deployments require the full `50000-60000/udp` range.
 - **No Local TLS/TURN**: The local environment uses unencrypted WebSocket (`ws://`) and lacks TURN relay servers.

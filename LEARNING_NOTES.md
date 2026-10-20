@@ -49,3 +49,71 @@
 - **Host-Bound Local Agent**: `node_ip=127.0.0.1` only works while the agent worker and browser run on the host; an agent running inside a Docker container would need a different address strategy (such as container networking or `host.docker.internal`).
 - **Single UDP Mux Port Scale Limit**: Adequate for development and small tests, but high-concurrency production requires multi-port ranges (`50000-60000`) across multiple CPU cores.
 - **No Embedded TURN / TLS Locally**: Embedded TURN server (TLS 443 / UDP 3478) and TLS reverse proxy are omitted for local simplicity, but required in production to navigate enterprise firewalls.
+
+---
+
+## [2026-10-20] - Phase 2: FastAPI Backend + SQLite Storage
+
+### (a) What Was Built
+- Initialized a standalone `uv` project in `api/` pinned to Python `3.12.12`.
+- Pinned and installed dependencies:
+  - `fastapi==0.151.0`
+  - `uvicorn==0.54.0`
+  - `livekit-api==1.2.2`
+  - `python-dotenv==1.2.4`
+  - `pytest==9.1.1`
+  - `httpx==0.28.1`
+- Built SQLite storage abstraction in [`api/app/storage.py`](file:///Users/shivamsingh/development/project/voice-agent/api/app/storage.py) using Python stdlib `sqlite3` (parameterized queries, WAL mode, foreign keys, no ORM). Tables: `agents`, `calls`, `transcript_lines`.
+- Built LiveKit interaction service in [`api/app/livekit_service.py`](file:///Users/shivamsingh/development/project/voice-agent/api/app/livekit_service.py) handling `CreateRoomRequest(empty_timeout=60)`, `CreateAgentDispatchRequest(agent_name="support-agent")`, and restricted customer `AccessToken` issuance with retry/timeout error handling.
+- Built FastAPI application in [`api/app/main.py`](file:///Users/shivamsingh/development/project/voice-agent/api/app/main.py):
+  - Public endpoints: `POST /agents`, `GET /agents`, `GET /agents/{id}`, `POST /calls`, `GET /calls/{id}` (transcript gated until `ended`), `GET /calls?status=active`.
+  - Internal endpoints: `POST /internal/calls/{id}/started`, `POST /internal/calls/{id}/transcript` (idempotent upsert), `POST /internal/calls/{id}/ended` protected by `X-Internal-Token` and verified via `secrets.compare_digest`.
+- Created demo seed script in [`api/seed.py`](file:///Users/shivamsingh/development/project/voice-agent/api/seed.py) provisioning "Acme Telecom Support" with recording disclosure instructions.
+- Automated test suite in [`api/tests/test_api.py`](file:///Users/shivamsingh/development/project/voice-agent/api/tests/test_api.py) using sync `TestClient` and temporary SQLite database (4 test suites, 100% pass).
+
+### (b) How the Underlying LiveKit / WebRTC Mechanism Works
+- **AccessToken JWT Claims & Grants**:
+  - LiveKit tokens encode permission grants into the `video` claim of an HMAC-SHA256 signed JWT.
+  - In our implementation, customer tokens are issued with:
+    - `identity`: `customer-<call_id>` (guarantees participant uniqueness).
+    - `roomJoin: true` and `room: <room_name>` (strictly confines connection to that room; the token is cryptographically rejected if presented to any other room).
+    - `canPublish: true` and `canPublishSources: ["microphone"]` (enforces audio-only publishing and rejects camera video tracks).
+    - `canPublishData: false` (strictly forbids publishing to LiveKit data channels, preventing customers from injecting spoofed supervisor whispers or arbitrary control packets).
+    - `canSubscribe: true` (permits receiving the audio track published by the voice agent).
+- **Explicit Dispatch vs. Token-Based Dispatch**:
+  - In standard *automatic/token dispatch*, any worker listening to LiveKit takes jobs based on generic room join events.
+  - In *explicit dispatch* (`lkapi.agent_dispatch.create_dispatch`), the API explicitly instructs LiveKit to dispatch a job targeting a specific registered agent pool (`agent_name="support-agent"`) for a specific room.
+  - Crucially, explicit dispatch attaches custom JSON `metadata: {"call_id": ..., "agent_id": ...}` directly to the job assignment. The worker receives this assignment on startup and immediately knows which database records and prompt instructions apply, avoiding extra discovery roundtrips.
+- **How a Worker Registers and Receives a Job (from LiveKit Agents Documentation)**:
+  - A Python LiveKit worker process establishes a WebSocket connection to LiveKit Server's internal agent RPC service (`/agent`).
+  - The worker announces its presence with a registered `agent_name` (e.g. `support-agent`).
+  - When the API calls `create_dispatch(agent_name="support-agent", room=...)`, the LiveKit SFU matches the dispatch request to an idle worker registered under that name.
+  - The SFU delivers a `JobAssignment` containing the room token and the dispatch `metadata`. The worker accepts the job, joins the room as an agent participant, and begins audio streaming.
+  - *(Note: Worker registration and job lifecycle will be empirically verified in Phase 3)*.
+
+### (c) Files & Functions to Read First
+- [`api/app/storage.py`](file:///Users/shivamsingh/development/project/voice-agent/api/app/storage.py): Review schema definitions and `set_call_ended()` (the single hook for post-call compliance).
+- [`api/app/livekit_service.py`](file:///Users/shivamsingh/development/project/voice-agent/api/app/livekit_service.py): Review `create_room_and_dispatch()` for `empty_timeout=60` rationale and customer token restrictions.
+- [`api/app/main.py`](file:///Users/shivamsingh/development/project/voice-agent/api/app/main.py): Inspect public call initialization, the transcript privacy gate in `get_call()`, and `verify_internal_token()`.
+- [`api/seed.py`](file:///Users/shivamsingh/development/project/voice-agent/api/seed.py): Review the demo system prompt and model/voice definitions.
+
+### (d) Reviewer Questions & Short Answers
+1. **Why is `empty_timeout` set to 60 seconds on room creation?**
+   - *Answer*: If a user invokes `POST /calls` but never opens their browser to join, or leaves immediately after joining, LiveKit would keep the room and its allocated WebRTC UDP mux resources open indefinitely. Setting `empty_timeout=60` instructs the SFU to automatically close and destroy the room after 60 seconds of vacancy.
+2. **Why is `can_publish_data` set to `False` on the customer token?**
+   - *Answer*: LiveKit data channels are used for supervisory control messages, including operator whispers delivered to the voice agent. Restricting `can_publish_data: false` at the cryptographic token level prevents the client browser from publishing data messages, guaranteeing customers cannot spoof operator whispers or tamper with agent state.
+3. **Why are internal endpoints protected by `secrets.compare_digest`?**
+   - *Answer*: Standard string comparison (`==`) short-circuits on the first mismatched character, creating subtle differences in execution time depending on how many leading characters match. An attacker can exploit this via timing analysis to brute-force secret keys over network requests. `secrets.compare_digest` executes in constant time regardless of character matches, preventing timing side-channel attacks.
+
+### (e) Decisions & Tradeoffs
+- **Stdlib `sqlite3` over ORMs**: Avoided SQLAlchemy/SQLModel to keep code simple, readable, and free of unnecessary dependencies for the POC. Queries are explicitly parameterized and use WAL mode for concurrency.
+- **Blocking SQLite in Async Handlers**: SQLite queries execute synchronously inside async route handlers. While inappropriate for heavy enterprise loads, this is an accepted POC tradeoff that eliminates the need for async database drivers or threadpools.
+- **Explicit Dispatch over Implicit Room Discovery**: Guarantees deterministic job targeting with metadata attached.
+
+### (f) Known Gaps
+- **Public Endpoints Lack Authentication**: `/agents` and `/calls` endpoints are unauthenticated in this POC.
+- **Abandoned Calls Remain in "created" in Database**: When LiveKit destroys an empty room after 60 seconds, the SQLite database row remains in `created` status because no webhook or polling mechanism syncs closed rooms back to SQLite in Phase 2.
+- **Seed Model and Voice IDs are UNVERIFIED**:
+  - Model: `llama-3.3-70b-versatile` (from [Groq Model Docs](https://console.groq.com/docs/models)).
+  - Voice: `aura-asteria-en` (from [Deepgram Aura Docs](https://developers.deepgram.com/docs/aura)).
+  - Both IDs are UNVERIFIED in the livekit-plugins runtime and must be re-checked against installed plugin versions in Phase 3.
