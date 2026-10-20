@@ -1,0 +1,29 @@
+# LiveKit Server Configuration for Local Development (macOS Docker Desktop)
+# Pinned livekit-server image: livekit/livekit-server:v1.13.10
+
+# Port 7880/tcp handles incoming HTTP REST API requests (room management, participant tokens)
+# and WebSocket signalling connections for WebRTC session negotiation.
+port: 7880
+
+# Logging level set to info for structured operational visibility without excessive trace verbosity.
+log_level: info
+
+# WebRTC Real-Time Communication settings
+rtc:
+  # Port 7881/tcp provides ICE-over-TCP fallback transport when UDP packets are blocked or dropped
+  # by restrictive client firewalls or corporate networks.
+  tcp_port: 7881
+
+  # Port 7882/udp enables single-port UDP muxing for all WebRTC RTP/RTCP media traffic.
+  # On macOS Docker Desktop, host networking is unavailable; muxing onto a single port avoids publishing
+  # and bridging a massive 10,000-port range (50000-60000).
+  udp_port: 7882
+
+  # Disables automatic public IP discovery via STUN. For local development on macOS, enabling this would
+  # advertise the host's public WAN IP, which fails or times out due to NAT loopback/hairpinning issues.
+  use_external_ip: false
+
+  # Explicitly advertises 127.0.0.1 as the server's ICE host candidate.
+  # Inside Docker, LiveKit would otherwise advertise its internal bridge IP (e.g. 172.18.0.x), which is
+  # completely unreachable from the macOS host browser. 127.0.0.1 routes correctly through Docker's port forwards.
+  node_ip: 127.0.0.1

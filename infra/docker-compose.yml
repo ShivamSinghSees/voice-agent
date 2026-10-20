@@ -1,0 +1,19 @@
+services:
+  livekit:
+    image: livekit/livekit-server:v1.13.10
+    command: --config /etc/livekit.yaml
+    restart: unless-stopped
+    ports:
+      # HTTP API & WebSocket signalling
+      - "7880:7880"
+      # ICE-over-TCP fallback
+      - "7881:7881"
+      # WebRTC media traffic (single-port UDP mux)
+      - "7882:7882/udp"
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+    environment:
+      # LiveKit API key and secret passed dynamically via environment variable.
+      # Sourced from repo root .env using: docker compose --env-file .env -f infra/docker-compose.yml
+      # No application-level secrets (STT/LLM/TTS) are exposed to this container.
+      LIVEKIT_KEYS: "${LIVEKIT_API_KEY}: ${LIVEKIT_API_SECRET}"
