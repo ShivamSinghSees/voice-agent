@@ -223,4 +223,111 @@
 
 ### (f) Known Gaps
 - **Audio Background Voice Cancellation (BVC)**: Not enabled on local self-hosted LiveKit (LiveKit Cloud proprietary feature).
-- **Web UI & Operator Whisper View**: Customer web client and operator listen/whisper interfaces are deferred to Phases 4 & 5.
+- **Web UI & Operator Whisper View**: Customer web client implemented in Phase 4; operator listen/whisper interfaces deferred to Phase 5.
+
+---
+
+## Phase 4: Customer Web Client (React + Vite + livekit-client)
+
+### (a) What Was Built
+1. **Frontend Architecture in `web/`**:
+   - React 18 + Vite + TypeScript application with pinned `livekit-client: 2.23.0` and `react-router-dom: ^6.28.0`.
+   - Routing structure separating the customer experience from operator tooling:
+     - `/`: [`CustomerCallPage.tsx`](file:///Users/shivamsingh/development/project/voice-agent/web/src/pages/CustomerCallPage.tsx) (active customer voice interface).
+     - `/operator`: [`OperatorPlaceholderPage.tsx`](file:///Users/shivamsingh/development/project/voice-agent/web/src/pages/OperatorPlaceholderPage.tsx) (Phase 5 placeholder).
+2. **Customer Call Lifecycle & Controls**:
+   - Dynamic agent picker fetching live profiles from `GET /agents` and rendering model, voice, and system prompt dynamically.
+   - User gesture-driven Call button calling `POST /calls` once, initializing the LiveKit `Room`, and establishing WebRTC audio streaming.
+   - Hang-up button that cleanly terminates the room session and triggers automatic polling of `GET /calls/{id}` until `status === "ended"`.
+3. **Live Transcript via Native Text Streams**:
+   - Registered `room.registerTextStreamHandler("lk.transcription", ...)` to consume incoming streaming transcriptions.
+   - Identified speakers via sender identity (`customer-...` -> "You", agent identity -> "Agent").
+   - Segment reconciliation using `lk.segment_id` for in-place text updates and finalization flags (`lk.transcription_final`).
+   - Detailed chunk logging with `performance.now()` millisecond timestamps to the browser console for barge-in inspection.
+4. **Agent State & Error Handling**:
+   - Monitored real-time agent state transitions (`listening`, `thinking`, `speaking`) via `RoomEvent.ParticipantAttributesChanged` reading participant attribute `lk.agent.state`.
+   - Comprehensive error alerts covering backend downtime (502 / network error), microphone permission rejection, connection failures, and 20-second remote agent join timeouts.
+   - Persisted database transcript card rendered upon call completion proving backend sync.
+
+---
+
+### (b) How the Underlying LiveKit / WebRTC Mechanism Works (What Happens on "Call" Click)
+
+1. **HTTP Initiation (`POST /calls`)**:
+   - The user clicks "Call Agent". This click serves as the mandatory browser **user gesture** required by browser Autoplay policies to initialize an `AudioContext` and start audio playback.
+   - The client issues `POST http://localhost:8000/calls` with `{ agent_id }`.
+   - The FastAPI backend validates the agent, inserts a new call record in `voice_agent.db`, provisions a LiveKit room with atomic dispatch (`agent_name="support-agent"`), and mints a cryptographically signed customer JWT `AccessToken` containing room permissions (join + publish audio).
+   - The API responds with `{ call_id, room_name, token, livekit_url: "ws://localhost:7880" }`.
+
+2. **WebSocket Signalling (`ws://localhost:7880`)**:
+   - The web client instantiates `new Room({ audioCaptureDefaults: { echoCancellation: true } })` and calls `await room.connect(livekit_url, token)`.
+   - The client establishes an HTTP/WebSocket handshake to `ws://localhost:7880/rtc`.
+   - The token is verified by LiveKit SFU using the shared `LIVEKIT_API_SECRET`.
+   - LiveKit sends a protobuf `JoinResponse` containing room information, local participant SID, and server configuration.
+
+3. **SDP Exchange & ICE Gathering**:
+   - LiveKit uses dual peer connections: a **publisher peer connection** (client -> SFU) and a **subscriber peer connection** (SFU -> client).
+   - LiveKit generates an SDP Offer over the WebSocket signalling channel.
+   - The browser parses the offer, generates an SDP Answer, and begins ICE candidate gathering.
+   - Local ICE candidates are gathered: in our self-hosted setup, the SFU advertises its host candidate at `127.0.0.1:7882` (UDP).
+   - The browser sends STUN connectivity checks directly to `127.0.0.1:7882/udp`. Because both client and SFU run locally on macOS, the ICE agent nominates a direct `host <-> host` candidate pair without requiring STUN/TURN traversal.
+
+4. **Microphone Track Publishing & Agent Track Subscription**:
+   - `room.localParticipant.setMicrophoneEnabled(true)` invokes browser `navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } })`.
+   - The resulting `MediaStreamTrack` is added to the publisher peer connection. WebRTC encodes PCM audio frames (Opus codec, 48kHz) and streams UDP packets to `127.0.0.1:7882`.
+   - Concurrently, the remote Python worker joins the room, creates an audio track for Deepgram TTS playback, and publishes it to the SFU.
+   - The SFU routes the agent track down the subscriber peer connection. The client SDK receives `RoomEvent.TrackSubscribed`.
+   - `track.attach(audioRef.current)` binds the incoming WebRTC `MediaStreamTrack` directly to the hidden `<audio autoPlay />` DOM element, streaming audio through the customer's headphones.
+
+5. **Transcription Streaming over Reliable Data Channel**:
+   - While audio flows over UDP media tracks, transcription flows over LiveKit's multiplexed WebRTC reliable data channel using the Data Streams sub-protocol.
+   - The worker writes chunks to text stream topic `lk.transcription`. The client's `registerTextStreamHandler` receives chunks sequentially with zero packet loss, updating segment text in-place.
+
+---
+
+### (c) Files & Functions to Read First
+
+- [`web/src/pages/CustomerCallPage.tsx`](file:///Users/shivamsingh/development/project/voice-agent/web/src/pages/CustomerCallPage.tsx):
+  - `handleStartCall()`: Complete connection sequence, room event attachment, text stream registration, and audio playback.
+  - `registerTextStreamHandler('lk.transcription', ...)`: Real-time text stream consumer with timestamped console logging and segment reconciliation.
+  - `handleHangUp()` & `pollSavedCallTranscript()`: Clean disconnection and post-call persistence verification.
+- [`web/src/services/api.ts`](file:///Users/shivamsingh/development/project/voice-agent/web/src/services/api.ts): Backend API integration (`fetchAgents`, `createCall`, `getCall`).
+- [`web/src/types.ts`](file:///Users/shivamsingh/development/project/voice-agent/web/src/types.ts): Clean, beginner-readable TypeScript models.
+- [`web/src/index.css`](file:///Users/shivamsingh/development/project/voice-agent/web/src/index.css): Plain, accessible CSS layout without bloated CSS frameworks or glassmorphic animations.
+
+---
+
+### (d) Reviewer Questions & Short Answers
+
+1. **Why must audio playback and microphone capture be started from a button click gesture rather than a `useEffect` on page load?**
+   - *Answer*: Modern web browsers enforce strict **Autoplay Policies**. Browsers block WebRTC audio playback and reject programmatic `getUserMedia` requests unless initiated by an explicit user gesture (such as clicking a "Call" button). Furthermore, running connection logic in React 18's `useEffect` under StrictMode causes double-mount cycles during development, creating duplicate room connections and orphaned dispatches. Starting strictly from `onClick` guarantees both autoplay compliance and exactly one room connection per user action.
+
+2. **Why does the web client need a signed JWT access token instead of just connecting with the server API key and secret?**
+   - *Answer*: Connecting directly with the API secret would require exposing `LIVEKIT_API_SECRET` in client-side JavaScript bundle files, compromising the entire SFU. The backend acts as an authorization gate: it authenticates/validates the caller, scopes permissions strictly to a specific room (`room_name`), restricts grants (e.g. `canPublish=True` for microphone audio, but `canPublishData=False` for whisper channels), sets short token expiry (e.g. 15 minutes), and stamps identity prefix `customer-...`.
+
+3. **What is the difference between WebRTC media tracks and WebRTC data channels in LiveKit, and why is transcription sent over data streams?**
+   - *Answer*: Audio tracks travel over SRTP (Secure Real-Time Transport Protocol) over UDP. They prioritize low latency over reliability: if a packet drops, WebRTC drops or conceals the sample rather than retransmitting, because delayed audio is useless in real-time conversation. In contrast, transcription text requires 100% transmission integrity: a lost token would corrupt words in the transcript. LiveKit uses SCTP (Stream Control Transmission Protocol) data channels over the DTLS connection, providing reliable, in-order text delivery with automatic retransmission while maintaining sub-50ms latency.
+
+4. **Why is the selected ICE candidate pair not readable directly through public properties of `Room`, and how is it verified?**
+   - *Answer*: `livekit-client` encapsulates the native browser `RTCPeerConnection` instances (`publisher` and `subscriber`) inside internal private classes (`RTCEngine` and `PCTransportManager`) to prevent client code from desynchronizing the transport state machine. Standard production inspection of ICE candidate pairs (confirming direct `host <-> host` binding on port `7882/udp`) is performed using Chrome's dedicated diagnostic interface at `chrome://webrtc-internals`.
+
+---
+
+### (e) Decisions & Tradeoffs
+
+- **Plain `livekit-client` over `@livekit/components-react`**:
+  - Pinned `livekit-client: 2.23.0`. Using the plain client SDK avoids wrapping components in opaque context providers and heavy pre-packaged CSS themes. Every line of room connection, track attachment, and text stream consumption is completely transparent and beginner-readable.
+- **Strict React Event Architecture**:
+  - Bound the call creation exclusively to `handleStartCall` on button click. Avoided any auto-connect side effects in `useEffect`, preventing React 18 StrictMode double-fetch bugs and duplicate backend dispatches.
+- **In-Place Segment Updating (`lk.segment_id`)**:
+  - Rather than treating each transcription message as a new appended chat bubble, the UI maps segments by `lk.segment_id`. Interim STT and TTS deltas update the active line in place and append an ellipsis (`...`) until `lk.transcription_final: "true"` commits the turn.
+- **Headphone Isolation Guidance**:
+  - Documented mandatory headphone usage during testing. In half-duplex or full-duplex conversational AI, acoustic feedback from unmuted laptop speakers into the microphone triggers the agent's VAD turn detector and causes the agent to interrupt itself.
+
+---
+
+### (f) Known Gaps
+
+- **Operator Listen & Whisper View**: Scheduled for Phase 5.
+- **Automated Browser Playwright Testing**: Playwright automated browser downloads are blocked by sandbox network restrictions; manual testing via local browser (`http://localhost:5173`) is required.
+- **Audio Background Voice Cancellation (BVC)**: Client uses standard WebRTC `echoCancellation`; server-side deep learning Krisp noise cancellation requires LiveKit Cloud.

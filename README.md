@@ -77,14 +77,43 @@ uv --directory agent run python agent.py start
 ```
 *(Use `python agent.py dev` during development for auto-reload).*
 
-### 7. Run Agent Unit & End-to-End Tests
+### 8. Start Web Client (Customer UI)
 ```bash
-# Run agent unit tests (truncation simulation, live Groq text pipeline)
-uv --directory agent run pytest
+# Install dependencies (pins livekit-client 2.23.0)
+cd web && npm install
 
-# Run end-to-end race condition test (verifies customer pre-join and call lifecycle)
-uv --directory agent run python scripts/test_race_condition.py
+# Start Vite dev server on :5173
+npm run dev
 ```
+
+> **IMPORTANT: Browser Origin & CORS**:
+> Always access the application at **`http://localhost:5173`** (do **not** use `http://127.0.0.1:5173`). The backend's default `CORS_ORIGINS` configuration is set to `http://localhost:5173`. Opening `127.0.0.1:5173` will trigger browser CORS preflight blocks.
+
+> **IMPORTANT: Wear Headphones During Live Call & Barge-In Testing**:
+> When testing live conversations and barge-in interruptions, **wear headphones**. If audio from the agent plays out through your computer speakers into your open microphone, the agent will detect its own speech as user speech and interrupt itself.
+
+---
+
+### Full System Run Order (4 Dedicated Terminals)
+For end-to-end local operation, run each service in its own terminal window:
+
+1. **Terminal 1 (LiveKit SFU Server)**:
+   ```bash
+   docker compose --env-file .env -f infra/docker-compose.yml up
+   ```
+2. **Terminal 2 (FastAPI Backend Service)**:
+   ```bash
+   uv --directory api run uvicorn app.main:app --port 8000
+   ```
+3. **Terminal 3 (LiveKit Agent Voice Worker)**:
+   ```bash
+   uv --directory agent run python agent.py dev
+   ```
+4. **Terminal 4 (React + Vite Web Client)**:
+   ```bash
+   cd web && npm run dev
+   ```
+   Open **`http://localhost:5173`** in Chrome/Brave/Firefox.
 
 ---
 
@@ -207,3 +236,4 @@ curl http://localhost:8000/calls/<call_id>
 - **Host-Bound Local Agent**: Setting `rtc.node_ip: 127.0.0.1` functions seamlessly when the agent worker and client browser run directly on the host machine. If the agent worker were containerized inside Docker, an internal service DNS name or bridge networking strategy would be required.
 - **Single UDP Port Muxing**: Muxing all media over `7882/udp` is optimal for development on macOS, but production high-scale deployments require the full `50000-60000/udp` range.
 - **No Local TLS/TURN**: The local environment uses unencrypted WebSocket (`ws://`) and lacks TURN relay servers.
+- **WebRTC Diagnostics via Browser Internals**: Because `livekit-client` keeps underlying `RTCPeerConnection` instances (`RTCEngine` and `PCTransportManager`) private without exposing public stats getters, active ICE candidate pair types (`host` vs `srflx` vs `relay`) must be inspected directly via `chrome://webrtc-internals` rather than via private property access in application code.

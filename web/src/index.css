@@ -1,0 +1,272 @@
+/* Plain, simple, clean CSS stylesheet */
+:root {
+  --bg-color: #111827;
+  --card-bg: #1f2937;
+  --border-color: #374151;
+  --text-main: #f9fafb;
+  --text-muted: #9ca3af;
+  --primary: #2563eb;
+  --primary-hover: #1d4ed8;
+  --danger: #dc2626;
+  --danger-hover: #b91c1c;
+  --agent-bg: #283548;
+  --user-bg: #1e3a5f;
+  --badge-bg: #374151;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  background-color: var(--bg-color);
+  color: var(--text-main);
+  line-height: 1.5;
+  padding: 20px;
+}
+
+.app-container {
+  max-width: 800px;
+  margin: 0 auto;
+}
+
+/* Header & Nav */
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid var(--border-color);
+  padding-bottom: 12px;
+  margin-bottom: 20px;
+}
+
+header h1 {
+  font-size: 1.4rem;
+  font-weight: 600;
+}
+
+nav a {
+  color: var(--text-muted);
+  text-decoration: none;
+  margin-left: 15px;
+  font-size: 0.95rem;
+}
+
+nav a.active {
+  color: var(--text-main);
+  font-weight: 600;
+  text-decoration: underline;
+}
+
+/* Card Container */
+.card {
+  background-color: var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 18px;
+  margin-bottom: 18px;
+}
+
+/* Agent Picker */
+.agent-picker {
+  margin-bottom: 14px;
+}
+
+.agent-picker label {
+  display: block;
+  font-size: 0.9rem;
+  font-weight: 500;
+  margin-bottom: 6px;
+  color: var(--text-muted);
+}
+
+.agent-picker select {
+  width: 100%;
+  padding: 10px;
+  background-color: #111827;
+  color: var(--text-main);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  font-size: 1rem;
+}
+
+.agent-details {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  margin-top: 8px;
+  line-height: 1.4;
+}
+
+/* Action Controls & Indicators */
+.controls-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+button {
+  padding: 10px 20px;
+  font-size: 1rem;
+  font-weight: 600;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-call {
+  background-color: var(--primary);
+  color: #ffffff;
+}
+
+.btn-call:hover:not(:disabled) {
+  background-color: var(--primary-hover);
+}
+
+.btn-hangup {
+  background-color: var(--danger);
+  color: #ffffff;
+}
+
+.btn-hangup:hover:not(:disabled) {
+  background-color: var(--danger-hover);
+}
+
+.status-indicator {
+  font-size: 0.95rem;
+  font-weight: 500;
+}
+
+.state-tag {
+  display: inline-block;
+  padding: 3px 8px;
+  border-radius: 4px;
+  font-size: 0.85rem;
+  background-color: var(--badge-bg);
+  margin-left: 8px;
+}
+
+/* Error Banner */
+.error-banner {
+  background-color: #7f1d1d;
+  border: 1px solid #991b1b;
+  color: #fecaca;
+  padding: 10px 14px;
+  border-radius: 4px;
+  margin-bottom: 16px;
+  font-size: 0.9rem;
+}
+
+/* Waiting / Warning Banner */
+.warning-banner {
+  background-color: #78350f;
+  border: 1px solid #92400e;
+  color: #fef3c7;
+  padding: 10px 14px;
+  border-radius: 4px;
+  margin-bottom: 16px;
+  font-size: 0.9rem;
+}
+
+/* Live Transcript Panel */
+.transcript-section {
+  display: flex;
+  flex-direction: column;
+}
+
+.transcript-header {
+  font-size: 1rem;
+  font-weight: 600;
+  margin-bottom: 10px;
+  display: flex;
+  justify-content: space-between;
+}
+
+.transcript-box {
+  background-color: #0b0f19;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  padding: 14px;
+  height: 320px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.empty-transcript {
+  color: var(--text-muted);
+  font-style: italic;
+  font-size: 0.9rem;
+  margin: auto;
+}
+
+.transcript-line {
+  padding: 8px 12px;
+  border-radius: 4px;
+  font-size: 0.92rem;
+  word-break: break-word;
+}
+
+.transcript-line.agent {
+  background-color: var(--agent-bg);
+  border-left: 3px solid #60a5fa;
+}
+
+.transcript-line.you {
+  background-color: var(--user-bg);
+  border-left: 3px solid #34d399;
+}
+
+.speaker-label {
+  font-weight: 700;
+  margin-right: 6px;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+}
+
+.agent-label {
+  color: #93c5fd;
+}
+
+.you-label {
+  color: #6ee7b7;
+}
+
+.interim-indicator {
+  color: #9ca3af;
+  font-style: italic;
+  margin-left: 6px;
+  font-size: 0.8rem;
+}
+
+/* Saved Database Transcript */
+.saved-transcript-box {
+  background-color: #0b0f19;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  padding: 12px;
+  margin-top: 10px;
+  max-height: 250px;
+  overflow-y: auto;
+  font-family: monospace;
+  font-size: 0.85rem;
+}
+
+.saved-transcript-row {
+  padding: 4px 0;
+  border-bottom: 1px solid #1f2937;
+}
+
+.saved-transcript-row:last-child {
+  border-bottom: none;
+}
