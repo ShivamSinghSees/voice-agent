@@ -1,4 +1,4 @@
-import { Agent, CallStartResponse, CallResponse } from '../types';
+import { Agent, CallStartResponse, CallResponse, ActiveCallSummary, OperatorTokenResponse } from '../types';
 
 // Read API base URL from Vite environment variable or default to localhost:8000
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
@@ -52,3 +52,36 @@ export async function getCall(callId: string): Promise<CallResponse> {
   }
   return resp.json();
 }
+
+/**
+ * Fetch currently active calls for operator monitoring.
+ */
+export async function fetchActiveCalls(): Promise<ActiveCallSummary[]> {
+  const resp = await fetch(`${API_BASE_URL}/calls?status=active`, {
+    headers: {
+      Accept: 'application/json',
+    },
+  });
+  if (!resp.ok) {
+    throw new Error(`Failed to fetch active calls: HTTP ${resp.status}`);
+  }
+  return resp.json();
+}
+
+/**
+ * Request an operator token to join an ongoing call as a hidden listener.
+ */
+export async function getOperatorToken(callId: string): Promise<OperatorTokenResponse> {
+  const resp = await fetch(`${API_BASE_URL}/calls/${callId}/operator-token`, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+    },
+  });
+  if (!resp.ok) {
+    const errorData = await resp.json().catch(() => ({}));
+    throw new Error(errorData.detail || `Failed to obtain operator token (status ${resp.status})`);
+  }
+  return resp.json();
+}
+

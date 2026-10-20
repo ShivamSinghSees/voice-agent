@@ -1,7 +1,7 @@
 import React from 'react';
 import { Routes, Route, NavLink } from 'react-router-dom';
 import { CustomerCallPage } from './pages/CustomerCallPage';
-import { OperatorPlaceholderPage } from './pages/OperatorPlaceholderPage';
+import { OperatorPage } from './pages/OperatorPage';
 
 export const App: React.FC = () => {
   return (
@@ -13,7 +13,7 @@ export const App: React.FC = () => {
             Customer Call
           </NavLink>
           <NavLink to="/operator" className={({ isActive }) => (isActive ? 'active' : '')}>
-            Operator View (Phase 5)
+            Operator View
           </NavLink>
         </nav>
       </header>
@@ -21,7 +21,7 @@ export const App: React.FC = () => {
       <main>
         <Routes>
           <Route path="/" element={<CustomerCallPage />} />
-          <Route path="/operator" element={<OperatorPlaceholderPage />} />
+          <Route path="/operator" element={<OperatorPage />} />
         </Routes>
       </main>
     </div>

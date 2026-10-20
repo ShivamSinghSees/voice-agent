@@ -270,3 +270,250 @@ button:disabled {
 .saved-transcript-row:last-child {
   border-bottom: none;
 }
+
+/* Operator Page Styles */
+.operator-page {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.page-description {
+  color: var(--text-muted);
+  font-size: 0.95rem;
+  margin-top: -8px;
+}
+
+.status-banner {
+  background-color: #064e3b;
+  border: 1px solid #059669;
+  color: #a7f3d0;
+  padding: 10px 14px;
+  border-radius: 4px;
+  font-size: 0.9rem;
+}
+
+.connecting-banner {
+  background-color: #1e1b4b;
+  border: 1px solid #4338ca;
+  color: #c7d2fe;
+  padding: 14px;
+  border-radius: 4px;
+  font-size: 0.95rem;
+  text-align: center;
+}
+
+.active-calls-section {
+  background-color: var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 20px;
+}
+
+.section-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+}
+
+.section-header h3 {
+  margin: 0;
+}
+
+.refresh-button {
+  background-color: #374151;
+  color: #f3f4f6;
+  border: 1px solid #4b5563;
+  padding: 6px 12px;
+  border-radius: 4px;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.refresh-button:hover:not(:disabled) {
+  background-color: #4b5563;
+}
+
+.no-calls-message {
+  color: var(--text-muted);
+  font-style: italic;
+  padding: 20px 0;
+  text-align: center;
+}
+
+.calls-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+.calls-table th {
+  text-align: left;
+  padding: 10px 12px;
+  background-color: #111827;
+  border-bottom: 1px solid var(--border-color);
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+.calls-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid #1f2937;
+}
+
+.calls-table tr:hover td {
+  background-color: #172033;
+}
+
+.monitor-button {
+  background-color: #2563eb;
+  color: white;
+  border: none;
+  padding: 6px 14px;
+  border-radius: 4px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.monitor-button:hover {
+  background-color: #1d4ed8;
+}
+
+.monitor-section {
+  background-color: var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.monitor-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  border-bottom: 1px solid var(--border-color);
+  padding-bottom: 16px;
+}
+
+.monitor-header h3 {
+  margin: 0 0 10px 0;
+}
+
+.participant-badges {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.badge {
+  display: inline-block;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.badge-green {
+  background-color: #064e3b;
+  color: #6ee7b7;
+  border: 1px solid #059669;
+}
+
+.badge-red {
+  background-color: #7f1d1d;
+  color: #fca5a5;
+  border: 1px solid #dc2626;
+}
+
+.badge-purple {
+  background-color: #3b0764;
+  color: #d8b4fe;
+  border: 1px solid #7e22ce;
+}
+
+.badge-gray {
+  background-color: #1f2937;
+  color: #9ca3af;
+  border: 1px solid #374151;
+}
+
+.leave-button {
+  background-color: #dc2626;
+  color: white;
+  border: none;
+  padding: 8px 16px;
+  border-radius: 4px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.leave-button:hover {
+  background-color: #b91c1c;
+}
+
+.whisper-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.whisper-form label {
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.whisper-input-row {
+  display: flex;
+  gap: 10px;
+}
+
+.whisper-input-row input {
+  flex: 1;
+  background-color: #0b0f19;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  padding: 10px 14px;
+  color: var(--text-color);
+  font-size: 0.95rem;
+}
+
+.whisper-input-row input:focus {
+  outline: none;
+  border-color: #3b82f6;
+}
+
+.whisper-input-row input:disabled {
+  background-color: #111827;
+  color: #6b7280;
+  cursor: not-allowed;
+}
+
+.whisper-send-button {
+  background-color: #7c3aed;
+  color: white;
+  border: none;
+  padding: 10px 18px;
+  border-radius: 4px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.whisper-send-button:hover:not(:disabled) {
+  background-color: #6d28d9;
+}
+
+.whisper-send-button:disabled {
+  background-color: #374151;
+  color: #6b7280;
+  cursor: not-allowed;
+}
+
+.field-hint.warning {
+  color: #fca5a5;
+}
+

@@ -57,11 +57,19 @@ class CallResponse(BaseModel):
 class CallSummaryResponse(BaseModel):
     id: str
     agent_id: str
+    agent_name: Optional[str] = None
     room_name: str
     status: str
     created_at: str
     started_at: Optional[str] = None
     ended_at: Optional[str] = None
+
+
+class OperatorTokenResponse(BaseModel):
+    call_id: str
+    room_name: str
+    token: str
+    livekit_url: str
 
 
 # --- Internal Schemas (Agent Worker -> API) ---

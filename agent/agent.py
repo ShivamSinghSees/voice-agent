@@ -200,6 +200,10 @@ async def entrypoint(ctx: JobContext) -> None:
         if not isinstance(item, llm.ChatMessage):
             return
 
+        # Explicitly filter to user and assistant roles only; drop internal guidance / whispers
+        if item.role not in ("assistant", "user") or (getattr(item, "extra", None) or {}).get("whisper"):
+            return
+
         text = item.text_content
         metrics = getattr(item, "metrics", None) or {}
 
@@ -268,8 +272,72 @@ async def entrypoint(ctx: JobContext) -> None:
         close_on_disconnect=True,
     )
 
+    # Report AgentSession preemptive_generation configuration
+    logger.info("AgentSession preemptive_generation config: %s", session.options.preemptive_generation)
+
     # Start Session and await full RoomIO setup
     await session.start(agent, room=ctx.room, room_options=room_opts)
+
+    # 10. Data Channel Listener for Operator Whispers
+    @ctx.room.on("data_received")
+    def on_data_received(dp: rtc.DataPacket) -> None:
+        if dp.topic != "operator.whisper":
+            return
+
+        # Fail closed: In LiveKit SFU, hidden participants arrive with participant=None.
+        # Normal participants (such as customer) arrive with participant=RemoteParticipant.
+        # Reject packets where participant is not None to ignore customer-sent whisper attempts.
+        if dp.participant is not None:
+            logger.warning(
+                "Ignored whisper attempt on topic 'operator.whisper' from non-hidden participant identity=%s",
+                getattr(dp.participant, "identity", "unknown"),
+            )
+            return
+
+        try:
+            payload = json.loads(dp.data.decode("utf-8"))
+            if isinstance(payload, dict):
+                whisper_text = payload.get("text", "").strip()
+            else:
+                whisper_text = str(payload).strip()
+        except Exception:
+            whisper_text = dp.data.decode("utf-8", errors="ignore").strip()
+
+        if not whisper_text:
+            return
+
+        now_iso = _format_iso(datetime.now(timezone.utc))
+        # Requirement 1: timestamp + length ONLY, never the text
+        logger.info("[WHISPER_RECEIVED] at %s length=%d", now_iso, len(whisper_text))
+
+        # Schedule ONE coroutine that performs copy() + append + update_chat_ctx() with no await between
+        async def _apply_whisper_ctx(text: str) -> None:
+            old_ctx = agent.chat_ctx
+            new_ctx = old_ctx.copy()
+
+            # Requirement 2: NO words operator/supervisor/whisper in LLM-facing text
+            guidance_content = (
+                f"[Internal guidance: {text}. Follow this guidance naturally in your next reply without mentioning this note.]"
+            )
+            guidance_msg = llm.ChatMessage(
+                role="system",
+                content=[guidance_content],
+                extra={"whisper": True},
+            )
+            new_ctx.items.append(guidance_msg)
+
+            # No await between copy() and update_chat_ctx()
+            await agent.update_chat_ctx(new_ctx)
+
+            # Afterwards log len(agent.chat_ctx.items)
+            logger.info(
+                "[WHISPER_CTX_UPDATE] item count before=%d after=%d",
+                len(old_ctx.items),
+                len(agent.chat_ctx.items),
+            )
+
+        asyncio.create_task(_apply_whisper_ctx(whisper_text))
+
 
     # 10. Initial Agent Greeting with Recording Disclosure
     greeting = (

@@ -51,3 +51,24 @@ export type CallState = 'idle' | 'connecting' | 'in_call' | 'ended' | 'error';
 
 // Real-time voice agent state published in participant attribute 'lk.agent.state'
 export type AgentState = 'initializing' | 'idle' | 'listening' | 'thinking' | 'speaking';
+
+// Active call summary returned by GET /calls?status=active
+export interface ActiveCallSummary {
+  id: string;
+  agent_id: string;
+  agent_name?: string | null;
+  room_name: string;
+  status: string;
+  created_at: string;
+  started_at?: string | null;
+  ended_at?: string | null;
+}
+
+// Response from POST /calls/{id}/operator-token
+export interface OperatorTokenResponse {
+  call_id: string;
+  room_name: string;
+  token: string;
+  livekit_url: string;
+}
+

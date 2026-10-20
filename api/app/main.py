@@ -14,7 +14,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 
 from app import config, schemas, storage
-from app.livekit_service import LiveKitServiceError, create_room_and_dispatch
+from app.livekit_service import LiveKitServiceError, create_operator_token, create_room_and_dispatch
 from seed import seed_demo_agent
 
 
@@ -220,6 +220,40 @@ async def list_calls(status_filter: Optional[str] = Query(None, alias="status"))
     """List calls, optionally filtered by status (e.g. GET /calls?status=active for operator view)."""
     calls = storage.list_calls(config.DATABASE_PATH, status=status_filter)
     return [schemas.CallSummaryResponse(**c) for c in calls]
+
+
+@app.post(
+    "/calls/{call_id}/operator-token",
+    response_model=schemas.OperatorTokenResponse,
+    tags=["Calls"],
+)
+async def get_operator_token(call_id: str):
+    """Generate a hidden, listen-only token for a supervisor/operator to join a call.
+
+    Validates:
+    - 404 if call does not exist
+    - 409 Conflict if call has already ended or failed
+    """
+    call = storage.get_call(config.DATABASE_PATH, call_id)
+    if not call:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Call '{call_id}' not found",
+        )
+
+    if call["status"] in ("ended", "failed"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cannot monitor call '{call_id}' with status '{call['status']}'",
+        )
+
+    token = create_operator_token(room_name=call["room_name"], call_id=call_id)
+    return schemas.OperatorTokenResponse(
+        call_id=call_id,
+        room_name=call["room_name"],
+        token=token,
+        livekit_url=config.LIVEKIT_URL,
+    )
 
 
 # --- Internal Endpoints (Worker -> API) ---

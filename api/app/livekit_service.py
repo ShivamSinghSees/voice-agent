@@ -154,3 +154,35 @@ async def list_agent_dispatches(room_name: str) -> list[dict[str, Any]]:
         ]
     finally:
         await lkapi.aclose()
+
+
+def create_operator_token(room_name: str, call_id: str) -> str:
+    """Mint a restricted, room-scoped AccessToken for an operator/supervisor.
+
+    GRANTS:
+    - identity: f"operator-{call_id[:8]}"
+    - hidden=True: SFU does not broadcast the operator to other participants
+    - can_subscribe=True: Operator can subscribe to audio tracks (customer + agent)
+    - can_publish=False: Operator cannot publish audio/video tracks
+    - can_publish_data=True: Operator can send whisper data packets to agent
+    - room: Scoped strictly to room_name
+    """
+    identity = f"operator-{call_id[:8]}"
+    token = (
+        api.AccessToken(config.LIVEKIT_API_KEY, config.LIVEKIT_API_SECRET)
+        .with_identity(identity)
+        .with_name("Supervisor")
+        .with_grants(
+            api.VideoGrants(
+                room_join=True,
+                room=room_name,
+                hidden=True,
+                can_subscribe=True,
+                can_publish=False,
+                can_publish_data=True,
+            )
+        )
+        .to_jwt()
+    )
+    return token
+

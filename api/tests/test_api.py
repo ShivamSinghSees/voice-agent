@@ -393,3 +393,63 @@ def test_transcript_gated_until_call_ended(client):
     assert len(ended_call["transcript"]) == 1
     assert ended_call["transcript"][0]["text"] == "In progress speech"
 
+
+def test_operator_token_generation_and_claims(client):
+    """Test POST /calls/{id}/operator-token returns valid JWT with hidden grants."""
+    from livekit import api as lk_api
+    call = _seed_call("test-op-call")
+
+    resp = client.post(f"/calls/{call['id']}/operator-token")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["call_id"] == call["id"]
+    assert data["room_name"] == call["room_name"]
+    assert "token" in data
+    assert "livekit_url" in data
+
+    # Verify token claims
+    verifier = lk_api.TokenVerifier(config.LIVEKIT_API_KEY, config.LIVEKIT_API_SECRET)
+    claims = verifier.verify(data["token"])
+    assert claims.identity.startswith("operator-")
+    assert claims.video.hidden is True
+    assert claims.video.can_subscribe is True
+    assert claims.video.can_publish is False
+    assert claims.video.can_publish_data is True
+    assert claims.video.room == call["room_name"]
+
+
+def test_operator_token_error_cases(client):
+    """Test 404 for missing call and 409 for ended/failed call."""
+    # 1. Unknown call -> 404
+    resp = client.post("/calls/non-existent-call-id/operator-token")
+    assert resp.status_code == 404
+
+    # 2. Ended call -> 409
+    call = _seed_call("test-ended-call")
+    headers = {"X-Internal-Token": config.INTERNAL_API_TOKEN}
+    client.post(f"/internal/calls/{call['id']}/ended", headers=headers, json={"ended_at": "2026-10-20T10:00:10Z"})
+    resp = client.post(f"/calls/{call['id']}/operator-token")
+    assert resp.status_code == 409
+    assert "Cannot monitor call" in resp.json()["detail"]
+
+
+def test_list_calls_filter_status(client):
+    """Test GET /calls?status=active returns only active calls and includes agent_name."""
+    c1 = _seed_call("test-filter-c1")
+    c2 = _seed_call("test-filter-c2")
+    headers = {"X-Internal-Token": config.INTERNAL_API_TOKEN}
+    # Transition c1 to active
+    client.post(f"/internal/calls/{c1['id']}/started", headers=headers, json={"started_at": "2026-10-20T10:00:00Z"})
+
+    # Fetch active calls
+    resp = client.get("/calls?status=active")
+    assert resp.status_code == 200
+    active_calls = resp.json()
+    assert any(c["id"] == c1["id"] for c in active_calls)
+    assert not any(c["id"] == c2["id"] for c in active_calls)
+    active_call = next(c for c in active_calls if c["id"] == c1["id"])
+    assert active_call["status"] == "active"
+    assert active_call["agent_name"] == "Seed Agent"
+
+
+

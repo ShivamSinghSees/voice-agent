@@ -149,16 +149,35 @@ def get_call(db_path: str, call_id: str) -> Optional[dict[str, Any]]:
         return None
 
 
+def update_agent_system_prompt(db_path: str, agent_id: str, system_prompt: str) -> None:
+    with get_connection(db_path) as conn:
+        conn.execute(
+            "UPDATE agents SET system_prompt = ? WHERE id = ?;",
+            (system_prompt, agent_id),
+        )
+
+
 def list_calls(db_path: str, status: Optional[str] = None) -> list[dict[str, Any]]:
     with get_connection(db_path) as conn:
         if status:
             cursor = conn.execute(
-                "SELECT id, agent_id, room_name, status, created_at, started_at, ended_at FROM calls WHERE status = ? ORDER BY created_at DESC;",
+                """
+                SELECT c.id, c.agent_id, a.name AS agent_name, c.room_name, c.status, c.created_at, c.started_at, c.ended_at
+                FROM calls c
+                LEFT JOIN agents a ON c.agent_id = a.id
+                WHERE c.status = ?
+                ORDER BY c.created_at DESC;
+                """,
                 (status,),
             )
         else:
             cursor = conn.execute(
-                "SELECT id, agent_id, room_name, status, created_at, started_at, ended_at FROM calls ORDER BY created_at DESC;"
+                """
+                SELECT c.id, c.agent_id, a.name AS agent_name, c.room_name, c.status, c.created_at, c.started_at, c.ended_at
+                FROM calls c
+                LEFT JOIN agents a ON c.agent_id = a.id
+                ORDER BY c.created_at DESC;
+                """
             )
         return [dict(row) for row in cursor.fetchall()]
 

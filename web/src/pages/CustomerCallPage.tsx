@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import {
   Room,
   RoomEvent,
+  ParticipantKind,
   RemoteTrack,
   RemoteTrackPublication,
   RemoteParticipant,
@@ -180,27 +181,74 @@ export const CustomerCallPage: React.FC = () => {
       room.registerTextStreamHandler(
         'lk.transcription',
         async (reader, participantInfo: { identity: string }) => {
-          const segmentId =
-            reader.info.attributes?.['lk.segment_id'] || reader.info.id || Math.random().toString();
           const sender = participantInfo.identity;
+          const remoteParticipant = room.remoteParticipants.get(sender);
+
+          // Identify speaker:
+          // Local participant / customer is 'You'
+          // Agent participant (via ParticipantKind.AGENT or known agent identity) is 'Agent'
+          // Ignore any other participant
           const isUser =
             sender === room.localParticipant.identity || sender.startsWith('customer-');
+          const isAgent =
+            (remoteParticipant && remoteParticipant.kind === ParticipantKind.AGENT) ||
+            sender.startsWith('agent-');
+
+          if (!isUser && !isAgent) {
+            console.log(`[TRANSCRIPTION] Ignoring transcription from non-agent/non-user: ${sender}`);
+            return;
+          }
+
           const speaker: 'You' | 'Agent' = isUser ? 'You' : 'Agent';
+          const segmentId =
+            reader.info.attributes?.['lk.segment_id'] || reader.info.id || Math.random().toString();
           const isFinalAttribute = reader.info.attributes?.['lk.transcription_final'] === 'true';
 
           let accumulatedText = '';
 
-          // Stream chunks incrementally as yielded by TextStreamReader
-          for await (const chunk of reader) {
-            const timestamp = performance.now();
-            accumulatedText += chunk;
+          try {
+            // Stream chunks incrementally as yielded by TextStreamReader
+            for await (const chunk of reader) {
+              const timestamp = performance.now();
+              accumulatedText += chunk;
 
-            // Log each individual chunk for verification during barge-in review
+              // Log each individual chunk for verification during barge-in review
+              console.log(
+                `[TRANSCRIPTION CHUNK] t=${timestamp.toFixed(2)}ms | sender=${sender} | segment=${segmentId} | final=${isFinalAttribute} | chunk="${chunk}"`
+              );
+
+              // Update or insert segment in live transcript state
+              setLiveTranscript((prev) => {
+                const existingIndex = prev.findIndex((item) => item.id === segmentId);
+                if (existingIndex >= 0) {
+                  const updated = [...prev];
+                  updated[existingIndex] = {
+                    ...updated[existingIndex],
+                    text: accumulatedText,
+                  };
+                  return updated;
+                } else {
+                  return [
+                    ...prev,
+                    {
+                      id: segmentId,
+                      speaker,
+                      text: accumulatedText,
+                      isFinal: isFinalAttribute,
+                      timestamp,
+                    },
+                  ];
+                }
+              });
+            }
+
+            // Stream ended
+            const endTimestamp = performance.now();
             console.log(
-              `[TRANSCRIPTION CHUNK] t=${timestamp.toFixed(2)}ms | sender=${sender} | segment=${segmentId} | final=${isFinalAttribute} | chunk="${chunk}"`
+              `[TRANSCRIPTION STREAM END] t=${endTimestamp.toFixed(2)}ms | sender=${sender} | segment=${segmentId} | final=${isFinalAttribute} | total="${accumulatedText}"`
             );
 
-            // Update or insert segment in live transcript state
+            // Mark segment as final when stream completes
             setLiveTranscript((prev) => {
               const existingIndex = prev.findIndex((item) => item.id === segmentId);
               if (existingIndex >= 0) {
@@ -208,43 +256,15 @@ export const CustomerCallPage: React.FC = () => {
                 updated[existingIndex] = {
                   ...updated[existingIndex],
                   text: accumulatedText,
+                  isFinal: true,
                 };
                 return updated;
-              } else {
-                return [
-                  ...prev,
-                  {
-                    id: segmentId,
-                    speaker,
-                    text: accumulatedText,
-                    isFinal: isFinalAttribute,
-                    timestamp,
-                  },
-                ];
               }
+              return prev;
             });
+          } catch (err: unknown) {
+            console.warn(`[TRANSCRIPTION STREAM ERROR] sender=${sender} | segment=${segmentId}:`, err);
           }
-
-          // Stream ended
-          const endTimestamp = performance.now();
-          console.log(
-            `[TRANSCRIPTION STREAM END] t=${endTimestamp.toFixed(2)}ms | sender=${sender} | segment=${segmentId} | final=${isFinalAttribute} | total="${accumulatedText}"`
-          );
-
-          // Mark segment as final when stream completes
-          setLiveTranscript((prev) => {
-            const existingIndex = prev.findIndex((item) => item.id === segmentId);
-            if (existingIndex >= 0) {
-              const updated = [...prev];
-              updated[existingIndex] = {
-                ...updated[existingIndex],
-                text: accumulatedText,
-                isFinal: true,
-              };
-              return updated;
-            }
-            return prev;
-          });
         }
       );
 
