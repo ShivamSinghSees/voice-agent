@@ -199,3 +199,94 @@ def test_user_turn_failsafe_latency_does_not_block_transcript():
     assert mock_record.call_args.kwargs["text"] == "I need help with my account."
     mock_write.assert_called_once_with("coro_placeholder")
 
+
+def test_greeting_item_records_transcript_and_logs_latency_greeting(caplog):
+    """Regression test: call handle_conversation_item with the greeting (assistant message, no preceding user turn, disconnect_fut not yet done/None) and assert a transcript line is recorded and LATENCY_GREETING is logged."""
+    import asyncio
+    from agent import handle_conversation_item
+
+    mock_write = MagicMock()
+    mock_record = MagicMock(return_value="coro_placeholder")
+
+    greeting_text = (
+        "Hello! Thank you for calling customer support. "
+        "Please note that this call is recorded for quality assurance. "
+        "How can I help you today?"
+    )
+    greeting_item = llm.ChatMessage(
+        role="assistant",
+        content=[greeting_text],
+    )
+    greeting_item.metrics = {
+        "started_speaking_at": 1700000002.5,
+        "stopped_speaking_at": 1700000007.8,
+    }
+
+    state = {
+        "agent_turn_idx": 0,
+        "last_user_turn_metrics": {},
+        "last_user_turn_text": "",
+    }
+
+    loop = asyncio.new_event_loop()
+    disconnect_fut = loop.create_future()
+
+    with caplog.at_level("INFO"):
+        handle_conversation_item(
+            greeting_item,
+            call_id="call-730e5cc4-97b6-4737-ba1d-e4c64966d4c5",
+            transcript_state=state,
+            schedule_transcript_write=mock_write,
+            record_transcript_line=mock_record,
+            disconnect_fut=disconnect_fut,
+            customer_joined_at=1700000000.0,
+            worker_saw_at=1700000000.2,
+        )
+
+    # 1. Assert transcript line is recorded
+    mock_record.assert_called_once()
+    assert mock_record.call_args.kwargs["speaker"] == "agent"
+    assert mock_record.call_args.kwargs["text"] == greeting_text
+    mock_write.assert_called_once_with("coro_placeholder")
+
+    # 2. Assert [LATENCY_GREETING] is logged
+    assert "[LATENCY_GREETING]" in caplog.text
+    assert "call-730e5cc4" in caplog.text
+    assert state["agent_turn_idx"] == 1
+    assert state["last_user_turn_metrics"] == {}
+
+
+def test_greeting_item_with_none_disconnect_fut(caplog):
+    """Verify greeting item succeeds when disconnect_fut is None and no preceding user turn."""
+    from agent import handle_conversation_item
+
+    mock_write = MagicMock()
+    mock_record = MagicMock(return_value="coro_placeholder")
+
+    greeting_item = llm.ChatMessage(
+        role="assistant",
+        content=["Welcome to customer support."],
+    )
+
+    state = {
+        "agent_turn_idx": 0,
+        "last_user_turn_metrics": {},
+    }
+
+    with caplog.at_level("INFO"):
+        handle_conversation_item(
+            greeting_item,
+            call_id="call-none-fut",
+            transcript_state=state,
+            schedule_transcript_write=mock_write,
+            record_transcript_line=mock_record,
+            disconnect_fut=None,
+        )
+
+    mock_record.assert_called_once()
+    assert mock_record.call_args.kwargs["speaker"] == "agent"
+    assert mock_record.call_args.kwargs["text"] == "Welcome to customer support."
+    mock_write.assert_called_once_with("coro_placeholder")
+    assert "[LATENCY_GREETING]" in caplog.text
+
+

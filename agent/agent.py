@@ -50,55 +50,62 @@ def _format_iso(dt: datetime | None) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 
 
-def handle_conversation_item(
+def record_item_transcript(
     item: Any,
     *,
     call_id: str,
     transcript_state: dict[str, Any],
     schedule_transcript_write: Any,
     record_transcript_line: Any,
-    tracking_llm: Any = None,
-    disconnect_fut: Any = None,
-    customer_joined_at: datetime | None = None,
-    worker_saw_at: datetime | None = None,
-    chat_ctx_items: list[Any] | None = None,
-) -> None:
-    """Handle conversation item with guaranteed decoupled transcript write before latency instrumentation.
+) -> dict[str, Any] | None:
+    """Record assistant or user turn transcript FIRST and INDEPENDENTLY of latency instrumentation."""
+    role = getattr(item, "role", None)
+    if role not in ("assistant", "user") or (getattr(item, "extra", None) or {}).get("whisper"):
+        return None
 
-    All latency and interruption logging is executed strictly after the transcript record call
-    and wrapped in try/except blocks to ensure instrumentation failures can never drop transcript
-    records or disrupt the active voice session.
-    """
-    if not isinstance(item, llm.ChatMessage):
-        return
+    text = getattr(item, "text_content", None)
+    if text is None:
+        content = getattr(item, "content", "")
+        if isinstance(content, list):
+            text = "".join(str(c) for c in content)
+        else:
+            text = str(content)
+    text = str(text)
 
-    # Explicitly filter to user and assistant roles only; drop internal guidance / whispers
-    if item.role not in ("assistant", "user") or (getattr(item, "extra", None) or {}).get("whisper"):
-        return
-
-    text = item.text_content
     metrics = getattr(item, "metrics", None) or {}
 
     started_speaking_at = metrics.get("started_speaking_at")
     stopped_speaking_at = metrics.get("stopped_speaking_at")
 
     if started_speaking_at is not None:
-        started_at_dt = datetime.fromtimestamp(started_speaking_at, tz=timezone.utc)
+        try:
+            started_at_dt = datetime.fromtimestamp(started_speaking_at, tz=timezone.utc)
+        except Exception:
+            started_at_dt = datetime.now(timezone.utc)
     elif getattr(item, "created_at", None) is not None:
-        started_at_dt = datetime.fromtimestamp(item.created_at, tz=timezone.utc)
+        try:
+            started_at_dt = datetime.fromtimestamp(item.created_at, tz=timezone.utc)
+        except Exception:
+            started_at_dt = datetime.now(timezone.utc)
     else:
         started_at_dt = datetime.now(timezone.utc)
 
     if stopped_speaking_at is not None:
-        ended_at_dt = datetime.fromtimestamp(stopped_speaking_at, tz=timezone.utc)
+        try:
+            ended_at_dt = datetime.fromtimestamp(stopped_speaking_at, tz=timezone.utc)
+        except Exception:
+            ended_at_dt = datetime.now(timezone.utc)
     else:
         ended_at_dt = datetime.now(timezone.utc)
 
     started_at_iso = _format_iso(started_at_dt)
     ended_at_iso = _format_iso(ended_at_dt)
 
-    if item.role == "user":
-        # 1. Record user turn transcript first and independently
+    agent_turn_idx = 0
+    is_interrupted = False
+
+    if role == "user":
+        # Record user turn transcript first and independently
         schedule_transcript_write(
             record_transcript_line(
                 speaker="user",
@@ -107,20 +114,12 @@ def handle_conversation_item(
                 ended_at=ended_at_iso,
             )
         )
-
-        # 2. Save user turn metrics for subsequent assistant turn latency correlation (fail-safe)
-        try:
-            transcript_state["last_user_turn_metrics"] = dict(metrics)
-            transcript_state["last_user_turn_text"] = text
-        except Exception as exc:
-            logger.warning("Failed saving user turn metrics: %s", exc)
-
-    elif item.role == "assistant":
+    elif role == "assistant":
         transcript_state["agent_turn_idx"] = transcript_state.get("agent_turn_idx", 0) + 1
         agent_turn_idx = transcript_state["agent_turn_idx"]
         is_interrupted = bool(getattr(item, "interrupted", False))
 
-        # 1. Record assistant turn transcript write FIRST and INDEPENDENTLY
+        # Record assistant turn transcript write FIRST and INDEPENDENTLY
         schedule_transcript_write(
             record_transcript_line(
                 speaker="agent",
@@ -130,7 +129,48 @@ def handle_conversation_item(
             )
         )
 
-        # 2. Interruption debug and latency tracking (fail-safe)
+    return {
+        "text": text,
+        "started_at_iso": started_at_iso,
+        "ended_at_iso": ended_at_iso,
+        "agent_turn_idx": agent_turn_idx,
+        "is_interrupted": is_interrupted,
+        "started_speaking_at": started_speaking_at,
+        "stopped_speaking_at": stopped_speaking_at,
+        "metrics": metrics,
+    }
+
+
+def track_item_latency(
+    item: Any,
+    *,
+    call_id: str,
+    transcript_state: dict[str, Any],
+    info: dict[str, Any],
+    tracking_llm: Any = None,
+    disconnect_fut: Any = None,
+    customer_joined_at: Any = None,
+    worker_saw_at: Any = None,
+    chat_ctx_items: list[Any] | None = None,
+) -> None:
+    """Compute and emit turn latency and interruption metrics (completely fail-safe)."""
+    role = getattr(item, "role", None)
+    text = info.get("text", "")
+    metrics = info.get("metrics") or {}
+    started_speaking_at = info.get("started_speaking_at")
+    stopped_speaking_at = info.get("stopped_speaking_at")
+    agent_turn_idx = info.get("agent_turn_idx", 0)
+    is_interrupted = info.get("is_interrupted", False)
+
+    if role == "user":
+        try:
+            transcript_state["last_user_turn_metrics"] = dict(metrics)
+            transcript_state["last_user_turn_text"] = text
+        except Exception as exc:
+            logger.warning("Failed saving user turn metrics: %s", exc)
+
+    elif role == "assistant":
+        # 1. Interruption debug and latency tracking (fail-safe)
         if is_interrupted:
             try:
                 interruption_ts = _format_iso(datetime.now(timezone.utc))
@@ -142,7 +182,13 @@ def handle_conversation_item(
                     latest_text,
                     text,
                 )
-                disconnect_done = disconnect_fut.done() if disconnect_fut else False
+                disconnect_done = False
+                if disconnect_fut is not None:
+                    try:
+                        disconnect_done = disconnect_fut.done()
+                    except Exception:
+                        disconnect_done = False
+
                 if not disconnect_done:
                     t_onset = transcript_state.get("user_speech_onset_time")
                     t_event = transcript_state.get("interruption_event_time") or time.time()
@@ -173,16 +219,22 @@ def handle_conversation_item(
             except Exception as exc:
                 logger.warning("Failed emitting interruption latency: %s", exc)
 
-        # 3. Conversational / greeting turn latency (fail-safe)
+        # 2. Conversational / greeting turn latency (fail-safe)
         try:
             last_user_metrics = transcript_state.get("last_user_turn_metrics") or {}
             if agent_turn_idx == 1 and not last_user_metrics:
-                cust_join_ts = (
-                    customer_joined_at.timestamp()
-                    if customer_joined_at
-                    else (worker_saw_at.timestamp() if worker_saw_at else time.time())
-                )
-                pub_ts = started_speaking_at or time.time()
+                if hasattr(customer_joined_at, "timestamp"):
+                    cust_join_ts = customer_joined_at.timestamp()
+                elif isinstance(customer_joined_at, (int, float)):
+                    cust_join_ts = float(customer_joined_at)
+                elif hasattr(worker_saw_at, "timestamp"):
+                    cust_join_ts = worker_saw_at.timestamp()
+                elif isinstance(worker_saw_at, (int, float)):
+                    cust_join_ts = float(worker_saw_at)
+                else:
+                    cust_join_ts = time.time()
+
+                pub_ts = started_speaking_at or getattr(item, "created_at", None) or time.time()
                 join_to_greeting_ms = (pub_ts - cust_join_ts) * 1000.0
                 logger.info(
                     "[LATENCY_GREETING] %s",
@@ -312,6 +364,50 @@ def handle_conversation_item(
             logger.warning("Failed calculating/emitting turn latency: %s", exc)
         finally:
             transcript_state["last_user_turn_metrics"] = {}
+
+
+def handle_conversation_item(
+    item: Any,
+    *,
+    call_id: str,
+    transcript_state: dict[str, Any],
+    schedule_transcript_write: Any,
+    record_transcript_line: Any,
+    tracking_llm: Any = None,
+    disconnect_fut: Any = None,
+    customer_joined_at: Any = None,
+    worker_saw_at: Any = None,
+    chat_ctx_items: list[Any] | None = None,
+) -> None:
+    """Handle conversation item with guaranteed decoupled transcript write before latency instrumentation.
+
+    The transcript-writing path executes first and independently. All latency/interruption instrumentation
+    is isolated in separate fail-safe blocks to ensure no metrics error can block transcript persistence.
+    """
+    info = record_item_transcript(
+        item,
+        call_id=call_id,
+        transcript_state=transcript_state,
+        schedule_transcript_write=schedule_transcript_write,
+        record_transcript_line=record_transcript_line,
+    )
+    if info is None:
+        return
+
+    try:
+        track_item_latency(
+            item,
+            call_id=call_id,
+            transcript_state=transcript_state,
+            info=info,
+            tracking_llm=tracking_llm,
+            disconnect_fut=disconnect_fut,
+            customer_joined_at=customer_joined_at,
+            worker_saw_at=worker_saw_at,
+            chat_ctx_items=chat_ctx_items,
+        )
+    except Exception as exc:
+        logger.warning("Failed in track_item_latency: %s", exc)
 
 
 @server.rtc_session(agent_name=config.AGENT_NAME)
@@ -445,6 +541,7 @@ async def entrypoint(ctx: JobContext) -> None:
     transcript_seq = 0
     transcript_lock = asyncio.Lock()
     pending_transcript_tasks: set[asyncio.Task[None]] = set()
+    disconnect_fut: asyncio.Future[None] = asyncio.get_running_loop().create_future()
 
     turn_tracking_state: dict[str, Any] = {
         "agent_turn_idx": 0,
@@ -480,6 +577,19 @@ async def entrypoint(ctx: JobContext) -> None:
             except Exception as exc:
                 logger.error("Failed to stream transcript line: %s", exc)
 
+    # Register session close and participant disconnect handlers before session.start()
+    @session.on("close")
+    def on_session_close(ev: Any) -> None:
+        logger.info("AgentSession close event received")
+        if not disconnect_fut.done():
+            disconnect_fut.set_result(None)
+
+    @ctx.room.on("participant_disconnected")
+    def on_participant_disconnected(p: rtc.RemoteParticipant) -> None:
+        if p.identity.startswith("customer-") and not disconnect_fut.done():
+            logger.info("Customer participant disconnected: %s", p.identity)
+            disconnect_fut.set_result(None)
+
     # Track user speech onset for interruption latency (fail-safe)
     @session.on("user_state_changed")
     def on_user_state_changed(ev: Any) -> None:
@@ -514,18 +624,74 @@ async def entrypoint(ctx: JobContext) -> None:
     # 8. Register Conversation Item Hook for Barge-in, Transcripts, and Latency
     @session.on("conversation_item_added")
     def on_conversation_item_added(ev: Any) -> None:
-        handle_conversation_item(
-            ev.item,
-            call_id=call_id,
-            transcript_state=turn_tracking_state,
-            schedule_transcript_write=_schedule_transcript_write,
-            record_transcript_line=_record_transcript_line,
-            tracking_llm=tracking_llm,
-            disconnect_fut=disconnect_fut,
-            customer_joined_at=customer_participant.joined_at,
-            worker_saw_at=worker_saw_at,
-            chat_ctx_items=agent.chat_ctx.items,
-        )
+        try:
+            item = getattr(ev, "item", None)
+            if item is None:
+                return
+
+            # 1. Transcript write must run FIRST in the handler, before any code that reads other closure variables
+            info: dict[str, Any] | None = None
+            try:
+                info = record_item_transcript(
+                    item,
+                    call_id=call_id,
+                    transcript_state=turn_tracking_state,
+                    schedule_transcript_write=_schedule_transcript_write,
+                    record_transcript_line=_record_transcript_line,
+                )
+            except Exception as exc:
+                logger.warning("Failed recording transcript in on_conversation_item_added: %s", exc)
+
+            if info is None:
+                return
+
+            # 2. Every other read of closure variables must be inside its own try/except that only logs a warning
+            disc_fut = None
+            try:
+                disc_fut = disconnect_fut
+            except Exception as exc:
+                logger.warning("Failed reading disconnect_fut closure variable: %s", exc)
+
+            t_llm = None
+            try:
+                t_llm = tracking_llm
+            except Exception as exc:
+                logger.warning("Failed reading tracking_llm closure variable: %s", exc)
+
+            cust_joined = None
+            try:
+                cust_joined = getattr(customer_participant, "joined_at", None)
+            except Exception as exc:
+                logger.warning("Failed reading customer_participant.joined_at closure variable: %s", exc)
+
+            w_saw = None
+            try:
+                w_saw = worker_saw_at
+            except Exception as exc:
+                logger.warning("Failed reading worker_saw_at closure variable: %s", exc)
+
+            chat_items = None
+            try:
+                chat_items = getattr(getattr(agent, "chat_ctx", None), "items", None)
+            except Exception as exc:
+                logger.warning("Failed reading agent.chat_ctx.items closure variable: %s", exc)
+
+            try:
+                track_item_latency(
+                    item,
+                    call_id=call_id,
+                    transcript_state=turn_tracking_state,
+                    info=info,
+                    tracking_llm=t_llm,
+                    disconnect_fut=disc_fut,
+                    customer_joined_at=cust_joined,
+                    worker_saw_at=w_saw,
+                    chat_ctx_items=chat_items,
+                )
+            except Exception as exc:
+                logger.warning("Failed in track_item_latency from on_conversation_item_added: %s", exc)
+        except Exception as exc:
+            logger.warning("Failed in on_conversation_item_added callback: %s", exc)
 
     # 9. Link Session Exclusively to Customer Participant
     # WHY participant_identity: Ensures the agent's STT and VAD are bound strictly to customer audio,
@@ -674,21 +840,7 @@ async def entrypoint(ctx: JobContext) -> None:
         logger.warning("Error saying initial greeting: %s", exc)
 
     # 11. Wait for Customer Disconnection / Call End
-    disconnect_fut: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-
-    @session.on("close")
-    def on_session_close(ev: Any) -> None:
-        logger.info("AgentSession close event received")
-        if not disconnect_fut.done():
-            disconnect_fut.set_result(None)
-
-    @ctx.room.on("participant_disconnected")
-    def on_participant_disconnected(p: rtc.RemoteParticipant) -> None:
-        if p.identity.startswith("customer-") and not disconnect_fut.done():
-            logger.info("Customer participant disconnected: %s", p.identity)
-            disconnect_fut.set_result(None)
-
-    # Wait until customer disconnects or session closes
+    # Wait until customer disconnects or session closes (handlers registered in Section 7 before session.start)
     await disconnect_fut
 
     # Capture ended_at the exact moment customer disconnects (before aclose/gather)
