@@ -220,9 +220,28 @@ curl http://localhost:8000/calls/<call_id>
 
 ---
 
-## Latency
+## Latency Measurement & Turn Analysis
 
-*(Measured latency metrics will be recorded in Phase 4 per the latency-measurement skill).*
+Latency is measured per conversational turn using monotonic and metric-derived timestamps across each pipeline stage:
+- **`user_stopped`**: VAD end-of-speech anchor (`_last_speaking_time`) after subtracting the silence and inference windows.
+- **`stt_final`**: Derived as `user_stopped + transcription_delay` (Deepgram Nova-3).
+- **`llm_first_token`**: Exact timestamp when the first streaming token delta arrives from Groq (`qwen/qwen3.8-27b`).
+- **`tts_first_audio`**: Derived timestamp when Deepgram Aura returns the first synthesized PCM audio buffer (`audio_published - playback_latency`).
+- **`audio_published`**: Exact timestamp when the first audio frame is pushed via `capture_frame()` to LiveKit's WebRTC audio source.
+- **`Headline Metric`**: `user_stopped -> audio_published` (`total_ms` / `e2e_latency`).
+
+### Generating Latency Reports from Worker Logs
+To process execution logs and output deduplicated Markdown tables with min, median, p95, and max percentiles:
+```bash
+uv --directory agent run python scripts/latency_report.py agent.log
+```
+*(Deduplicates strictly by `(call_id, turn_idx)`. Excludes greeting from conversational turn medians, reporting `join -> first greeting audio` separately).*
+
+### Unobservable Latency Gaps
+The worker cannot observe physical acoustic and client-side device latency:
+1. Client microphone capture and OS audio buffer delays.
+2. Browser WebRTC jitter buffer delay.
+3. Browser WebRTC audio decoding and DAC/speaker acoustic playout.
 
 ---
 

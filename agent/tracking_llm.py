@@ -4,6 +4,7 @@ Enables explicit inspection and logging of full generated text versus
 the truncated text retained in chat history when a barge-in (interruption) occurs.
 """
 
+import time
 from typing import Any
 from livekit.agents import llm, types
 
@@ -15,6 +16,8 @@ class TrackingLLM(llm.LLM):
         super().__init__()
         self.inner = inner
         self.latest_full_text: str = ""
+        self.latest_chat_called_at: float | None = None
+        self.latest_first_token_at: float | None = None
 
     @property
     def model(self) -> str:
@@ -22,7 +25,6 @@ class TrackingLLM(llm.LLM):
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.inner, name)
-
 
     def chat(
         self,
@@ -35,6 +37,8 @@ class TrackingLLM(llm.LLM):
         """Forward chat invocation to inner LLM while capturing stream deltas in latest_full_text."""
         # Reset turn tracking buffer
         self.latest_full_text = ""
+        self.latest_chat_called_at = time.time()
+        self.latest_first_token_at = None
         parent = self
 
         inner_stream = self.inner.chat(
@@ -56,6 +60,8 @@ class TrackingLLM(llm.LLM):
             async def _run(self) -> None:
                 async for chunk in inner_stream:
                     if chunk.delta and chunk.delta.content:
+                        if parent.latest_first_token_at is None:
+                            parent.latest_first_token_at = time.time()
                         parent.latest_full_text += chunk.delta.content
                     self._event_ch.send_nowait(chunk)
 

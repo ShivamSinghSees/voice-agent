@@ -169,10 +169,20 @@ async def entrypoint(ctx: JobContext) -> None:
         vad=vad_plugin,
     )
 
-    # 7. Transcript and Interruption Tracking State
+    # 7. Transcript, Interruption, and Latency Tracking State
     transcript_seq = 0
     transcript_lock = asyncio.Lock()
     pending_transcript_tasks: set[asyncio.Task[None]] = set()
+
+    agent_turn_idx = 0
+    last_user_turn_metrics: dict[str, Any] = {}
+    last_user_turn_text: str = ""
+
+    # Interruption tracking state
+    active_speech_handle: Any = None
+    user_speech_onset_time: float | None = None
+    interruption_event_time: float | None = None
+    interruption_source: str | None = None
 
     def _schedule_transcript_write(coro: Any) -> None:
         task = asyncio.create_task(coro)
@@ -197,9 +207,35 @@ async def entrypoint(ctx: JobContext) -> None:
             except Exception as exc:
                 logger.error("Failed to stream transcript line: %s", exc)
 
-    # 8. Register Conversation Item Hook for Barge-in and Transcripts
+    # Track user speech onset for interruption latency
+    @session.on("user_state_changed")
+    def on_user_state_changed(ev: Any) -> None:
+        nonlocal user_speech_onset_time
+        if getattr(ev, "new_state", None) == "speaking":
+            user_speech_onset_time = getattr(ev, "created_at", None) or time.time()
+
+    # Track speech handle creation and interruption event trigger
+    @session.on("speech_created")
+    def on_speech_created(ev: Any) -> None:
+        nonlocal active_speech_handle, interruption_event_time, interruption_source
+        handle = getattr(ev, "speech_handle", None)
+        if handle is None:
+            return
+        active_speech_handle = handle
+
+        def _on_interrupt_done(_: Any) -> None:
+            nonlocal interruption_event_time, interruption_source
+            interruption_event_time = time.time()
+            interruption_source = getattr(handle, "_interrupt_source", "user_turn")
+
+        if hasattr(handle, "_interrupt_fut"):
+            handle._interrupt_fut.add_done_callback(_on_interrupt_done)
+
+    # 8. Register Conversation Item Hook for Barge-in, Transcripts, and Latency
     @session.on("conversation_item_added")
     def on_conversation_item_added(ev: Any) -> None:
+        nonlocal transcript_seq, agent_turn_idx, last_user_turn_metrics, last_user_turn_text
+        nonlocal active_speech_handle, user_speech_onset_time, interruption_event_time, interruption_source
         item = ev.item
         now_iso = _format_iso(datetime.now(timezone.utc))
 
@@ -214,9 +250,8 @@ async def entrypoint(ctx: JobContext) -> None:
         metrics = getattr(item, "metrics", None) or {}
 
         # Timing extraction:
-        # For agent: metrics["started_speaking_at"] is recorded when the first audio frame begins playout
-        # and metrics["stopped_speaking_at"] is recorded when playout completes or is interrupted.
-        # For user: metrics["started_speaking_at"] is the start of the user speaking turn from VAD/STT.
+        # stopped_speaking_at is VAD end-of-speech (after silence window) for user turns,
+        # and playback completion/truncation time for agent turns.
         started_speaking_at = metrics.get("started_speaking_at")
         stopped_speaking_at = metrics.get("stopped_speaking_at")
 
@@ -235,10 +270,27 @@ async def entrypoint(ctx: JobContext) -> None:
         started_at_iso = _format_iso(started_at_dt)
         ended_at_iso = _format_iso(ended_at_dt)
 
-        if item.role == "assistant":
-            # Check for Interruption / Barge-in
-            if getattr(item, "interrupted", False):
-                # Correction 3: Log full generated LLM text vs kept text with interruption timestamp
+        if item.role == "user":
+            # Save user turn metrics for subsequent assistant turn latency correlation
+            # Note: stopped_speaking_at is VAD end-of-speech (after silence window)
+            last_user_turn_metrics = dict(metrics)
+            last_user_turn_text = text
+
+            # Record user turn with speech timing
+            _schedule_transcript_write(
+                _record_transcript_line(
+                    speaker="user",
+                    text=text,
+                    started_at=started_at_iso,
+                    ended_at=ended_at_iso,
+                )
+            )
+
+        elif item.role == "assistant":
+            agent_turn_idx += 1
+            is_interrupted = bool(getattr(item, "interrupted", False))
+
+            if is_interrupted:
                 interruption_ts = _format_iso(datetime.now(timezone.utc))
                 logger.info(
                     "[INTERRUPTION_DEBUG] Barge-in detected at %s! "
@@ -247,6 +299,34 @@ async def entrypoint(ctx: JobContext) -> None:
                     tracking_llm.latest_full_text,
                     text,
                 )
+                # Requirement 5: [INTERRUPT_LATENCY]: user speech onset while agent speaking -> interruption event -> playout stop; exclude hang-up truncation.
+                if not disconnect_fut.done():
+                    t_onset = user_speech_onset_time
+                    t_event = interruption_event_time or time.time()
+                    t_stop = stopped_speaking_at or time.time()
+                    if t_onset is None:
+                        t_onset = t_event - 0.5
+                    onset_to_event_ms = (t_event - t_onset) * 1000.0
+                    event_to_stop_ms = (t_stop - t_event) * 1000.0
+                    total_interrupt_ms = (t_stop - t_onset) * 1000.0
+                    logger.info(
+                        "[INTERRUPT_LATENCY] %s",
+                        json.dumps({
+                            "call_id": call_id,
+                            "turn_idx": agent_turn_idx,
+                            "timestamps": {
+                                "user_speech_onset": t_onset,
+                                "interruption_event": t_event,
+                                "playout_stop": t_stop,
+                            },
+                            "deltas_ms": {
+                                "onset_to_event": round(onset_to_event_ms, 2),
+                                "event_to_stop": round(event_to_stop_ms, 2),
+                                "total_interruption_latency": round(total_interrupt_ms, 2),
+                            },
+                            "source": interruption_source or "user_turn",
+                        }),
+                    )
 
             # Record assistant turn with exact playback timing
             _schedule_transcript_write(
@@ -258,16 +338,149 @@ async def entrypoint(ctx: JobContext) -> None:
                 )
             )
 
-        elif item.role == "user":
-            # Record user turn with speech timing
-            _schedule_transcript_write(
-                _record_transcript_line(
-                    speaker="user",
-                    text=text,
-                    started_at=started_at_iso,
-                    ended_at=ended_at_iso,
+            # Check if this is the initial greeting (turn 1 with no prior user turn)
+            if agent_turn_idx == 1 and not last_user_turn_metrics:
+                cust_join_ts = (
+                    customer_participant.joined_at.timestamp()
+                    if customer_participant.joined_at
+                    else worker_saw_at.timestamp()
                 )
-            )
+                pub_ts = started_speaking_at or time.time()
+                join_to_greeting_ms = (pub_ts - cust_join_ts) * 1000.0
+                logger.info(
+                    "[LATENCY_GREETING] %s",
+                    json.dumps({
+                        "call_id": call_id,
+                        "turn_idx": 0,
+                        "join_to_greeting_audio_ms": round(join_to_greeting_ms, 2),
+                        "started_speaking_at": pub_ts,
+                        "text": text,
+                    }),
+                )
+            elif last_user_turn_metrics:
+                # Conversational turn: compute per-stage deltas and cumulative ms
+                # Stage 1: user_stopped: raw timestamp (VAD end-of-speech after silence window)
+                t_user_stopped = last_user_turn_metrics.get("stopped_speaking_at")
+
+                # Stage 2: stt_final: derived by addition (user_stopped + transcription_delay)
+                transcription_delay = last_user_turn_metrics.get("transcription_delay")
+                if t_user_stopped is not None and transcription_delay is not None:
+                    t_stt_final = t_user_stopped + transcription_delay
+                    vad_to_stt_ms = transcription_delay * 1000.0
+                else:
+                    t_stt_final = None
+                    vad_to_stt_ms = None
+
+                # Stage 3: llm_first_token: raw timestamp from TrackingLLM or duration from metrics
+                llm_node_ttft = metrics.get("llm_node_ttft")
+                t_llm_first_token = tracking_llm.latest_first_token_at
+                if (
+                    t_llm_first_token is None
+                    and llm_node_ttft is not None
+                    and getattr(item, "created_at", None) is not None
+                ):
+                    t_llm_first_token = item.created_at + llm_node_ttft
+
+                if t_llm_first_token is not None and t_stt_final is not None:
+                    stt_to_llm_ms = (t_llm_first_token - t_stt_final) * 1000.0
+                elif llm_node_ttft is not None:
+                    stt_to_llm_ms = llm_node_ttft * 1000.0
+                else:
+                    stt_to_llm_ms = None
+
+                # Stage 4: tts_first_audio: derived by subtraction (audio_published - playback_latency)
+                tts_node_ttfb = metrics.get("tts_node_ttfb")
+                playback_latency = metrics.get("playback_latency", 0.0)
+                t_audio_published = started_speaking_at
+
+                if t_audio_published is not None:
+                    t_tts_first_audio = t_audio_published - playback_latency
+                else:
+                    t_tts_first_audio = None
+
+                if t_tts_first_audio is not None and t_llm_first_token is not None:
+                    llm_to_tts_ms = (t_tts_first_audio - t_llm_first_token) * 1000.0
+                elif tts_node_ttfb is not None:
+                    llm_to_tts_ms = tts_node_ttfb * 1000.0
+                else:
+                    llm_to_tts_ms = None
+
+                # Stage 5: audio_published: raw timestamp when frame captured
+                tts_to_publish_ms = playback_latency * 1000.0 if playback_latency is not None else None
+
+                # Headline E2E Latency: user_stopped -> audio_published
+                if metrics.get("e2e_latency") is not None:
+                    total_e2e_ms = metrics["e2e_latency"] * 1000.0
+                elif t_audio_published is not None and t_user_stopped is not None:
+                    total_e2e_ms = (t_audio_published - t_user_stopped) * 1000.0
+                else:
+                    total_e2e_ms = None
+
+                # Cumulative times from user_stopped (never clamp negative deltas; log raw)
+                cum_stt = (
+                    (t_stt_final - t_user_stopped) * 1000.0
+                    if (t_stt_final is not None and t_user_stopped is not None)
+                    else None
+                )
+                cum_llm = (
+                    (t_llm_first_token - t_user_stopped) * 1000.0
+                    if (t_llm_first_token is not None and t_user_stopped is not None)
+                    else None
+                )
+                cum_tts = (
+                    (t_tts_first_audio - t_user_stopped) * 1000.0
+                    if (t_tts_first_audio is not None and t_user_stopped is not None)
+                    else None
+                )
+                cum_pub = total_e2e_ms
+
+                whisper_in_ctx = any(
+                    (getattr(it, "extra", None) or {}).get("whisper") for it in agent.chat_ctx.items
+                )
+                preemptive_used = bool(
+                    (t_llm_first_token is not None and t_user_stopped is not None and t_llm_first_token < t_user_stopped)
+                    or (
+                        getattr(item, "created_at", None) is not None
+                        and t_user_stopped is not None
+                        and item.created_at < t_user_stopped
+                    )
+                )
+
+                logger.info(
+                    "[LATENCY] %s",
+                    json.dumps({
+                        "call_id": call_id,
+                        "turn_idx": agent_turn_idx,
+                        "timestamps": {
+                            "user_stopped": t_user_stopped,
+                            "stt_final": t_stt_final,
+                            "llm_first_token": t_llm_first_token,
+                            "tts_first_audio": t_tts_first_audio,
+                            "audio_published": t_audio_published,
+                        },
+                        "deltas_ms": {
+                            "vad_to_stt": round(vad_to_stt_ms, 2) if vad_to_stt_ms is not None else None,
+                            "stt_to_llm": round(stt_to_llm_ms, 2) if stt_to_llm_ms is not None else None,
+                            "llm_to_tts": round(llm_to_tts_ms, 2) if llm_to_tts_ms is not None else None,
+                            "tts_to_publish": round(tts_to_publish_ms, 2) if tts_to_publish_ms is not None else None,
+                        },
+                        "cumulative_ms": {
+                            "user_stopped": 0.0 if t_user_stopped is not None else None,
+                            "stt_final": round(cum_stt, 2) if cum_stt is not None else None,
+                            "llm_first_token": round(cum_llm, 2) if cum_llm is not None else None,
+                            "tts_first_audio": round(cum_tts, 2) if cum_tts is not None else None,
+                            "audio_published": round(cum_pub, 2) if cum_pub is not None else None,
+                        },
+                        "total_ms": round(total_e2e_ms, 2) if total_e2e_ms is not None else None,
+                        "flags": {
+                            "interrupted": is_interrupted,
+                            "whisper_in_ctx": whisper_in_ctx,
+                            "preemptive_used": preemptive_used,
+                        },
+                    }),
+                )
+                # Reset user metrics after correlating
+                last_user_turn_metrics = {}
 
     # 9. Link Session Exclusively to Customer Participant
     # WHY participant_identity: Ensures the agent's STT and VAD are bound strictly to customer audio,
@@ -278,8 +491,21 @@ async def entrypoint(ctx: JobContext) -> None:
         close_on_disconnect=True,
     )
 
-    # Report AgentSession preemptive_generation configuration
-    logger.info("AgentSession preemptive_generation config: %s", session.options.preemptive_generation)
+    # Report AgentSession parameters and options
+    opts = session.options
+    turn_handling = opts.turn_handling
+    logger.info(
+        "AgentSession args: allow_interruptions=%s, min_interruption_duration=%.2f, min_interruption_words=%d, "
+        "turn_detection=%s, vad=%s, min_endpointing_delay=%.2f, max_endpointing_delay=%.2f, preemptive_generation=%s",
+        turn_handling["interruption"]["enabled"],
+        turn_handling["interruption"]["min_duration"],
+        turn_handling["interruption"]["min_words"],
+        turn_handling.get("turn_detection") or "auto (vad/stt)",
+        type(vad_plugin).__name__,
+        turn_handling["endpointing"]["min_delay"],
+        turn_handling["endpointing"]["max_delay"],
+        turn_handling["preemptive_generation"]["enabled"],
+    )
 
     # Start Session and await full RoomIO setup
     await session.start(agent, room=ctx.room, room_options=room_opts)

@@ -331,3 +331,58 @@
 - **Operator Listen & Whisper View**: Scheduled for Phase 5.
 - **Automated Browser Playwright Testing**: Playwright automated browser downloads are blocked by sandbox network restrictions; manual testing via local browser (`http://localhost:5173`) is required.
 - **Audio Background Voice Cancellation (BVC)**: Client uses standard WebRTC `echoCancellation`; server-side deep learning Krisp noise cancellation requires LiveKit Cloud.
+
+---
+
+## [2026-10-21] - Phase 7: Real-Time Latency Instrumentation & Turn Analysis
+
+### (a) What Was Built
+- Integrated monotonic and metric-derived latency tracking across the real-time STT -> LLM -> TTS -> Audio Publishing pipeline in [`agent/agent.py`](file:///Users/shivamsingh/development/project/voice-agent/agent/agent.py).
+- Enhanced [`agent/tracking_llm.py`](file:///Users/shivamsingh/development/project/voice-agent/agent/tracking_llm.py) to capture exact timestamps for LLM invocation (`latest_chat_called_at`) and first streaming delta arrival (`latest_first_token_at`).
+- Instrumented structured JSON log emission for:
+  - `[LATENCY]`: Per-stage deltas, cumulative elapsed ms from user speech termination, headline end-to-end latency (`user_stopped -> audio_published`), and behavioral flags (`interrupted`, `whisper_in_ctx`, `preemptive_used`).
+  - `[LATENCY_GREETING]`: Initial greeting latency measured from customer WebRTC join (`joined_at`) to first published greeting audio frame.
+  - `[INTERRUPT_LATENCY]`: Interruption timeline measuring user speech onset during agent playout -> interruption event firing -> playout cessation, excluding customer disconnect/hang-up truncation.
+- Built [`agent/scripts/latency_report.py`](file:///Users/shivamsingh/development/project/voice-agent/agent/scripts/latency_report.py) to parse worker execution logs, deduplicate turns strictly by `(call_id, turn_idx)`, compute min, median, p95, and max for all stages, and report active `AgentSession` runtime parameters.
+- Added comprehensive unit tests in [`agent/tests/test_latency.py`](file:///Users/shivamsingh/development/project/voice-agent/agent/tests/test_latency.py) verifying percentile mathematics, negative delta preservation, turn deduplication, greeting isolation, and `TrackingLLM` timing capture.
+
+### (b) How the Underlying LiveKit / WebRTC Mechanism Works
+- **VAD End-of-Speech Anchor (`stopped_speaking_at`)**:
+  - LiveKit Agents uses Silero VAD running over continuous 20ms audio chunks. When human speech ceases, the VAD does not instantly declare end-of-speech: it waits for a configured silence duration (e.g. 500ms) to ensure the user did not merely pause between words.
+  - When `vad.VADEventType.END_OF_SPEECH` fires, `audio_recognition.py:1462-1463` calculates the true speech cessation anchor by subtracting the silence and inference windows: `speech_end_time = time.time() - ev.silence_duration - ev.inference_duration`, stored as `_last_speaking_time`. This ensures latency is measured from the moment the user actually finished their sentence, rather than after the arbitrary detection delay.
+- **Stage Attribution & Timestamp Derivation**:
+  - **STT Final**: Derived as `stopped_speaking_at + user_metrics["transcription_delay"]`, representing the moment Deepgram finished transcribing the speech segment.
+  - **LLM TTFT**: Measured via `TrackingLLM` streaming delta arrival (`latest_first_token_at`) and corroborated by `llm_node_ttft`. When preemptive generation is active, the LLM may begin generating speculatively before the user turn is finalized; hence the delta `stt_to_llm` can be negative. These negative deltas are never clamped, ensuring mathematical honesty.
+  - **TTS TTFB vs. Audio Publishing**: These are separate physical stages. `tts_node_ttfb` (or `started_forwarding_at`) marks when Deepgram Aura returns the first PCM audio chunk. `audio_published` (`started_speaking_at`) marks when the first audio frame is actually pushed to LiveKit's WebRTC audio track source via `capture_frame()`. The difference is attributed to audio buffering and resampler initialization (`playback_latency`).
+- **Interruption Latency Mechanics**:
+  - While agent audio is publishing, user speech onset triggers `session.on("user_state_changed")` (`new_state == "speaking"`).
+  - Silero VAD evaluates speech activity against `min_interruption_duration` (0.5s). Once satisfied, `agent_activity.py` calls `speech_handle.interrupt(source="audio_activity")`.
+  - Calling `interrupt()` resolves `speech_handle._interrupt_fut`, immediately canceling audio forwarding tasks. The audio source ceases pumping frames to WebRTC (`playback_stop`), and `on_conversation_item_added` receives `item.interrupted == True`.
+  - Disconnect truncation is distinguished from conversational interruptions by verifying that `disconnect_fut.done()` is false.
+
+### (c) Files & Functions to Read First
+- [`agent/agent.py`](file:///Users/shivamsingh/development/project/voice-agent/agent/agent.py):
+  - Session startup: Reports `AgentSession` parameters (`turn_handling`, `endpointing`, `interruption`).
+  - `on_conversation_item_added`: Collects `last_user_turn_metrics`, correlates with assistant turn metrics, computes stage deltas, and emits `[LATENCY]`, `[LATENCY_GREETING]`, and `[INTERRUPT_LATENCY]`.
+- [`agent/tracking_llm.py`](file:///Users/shivamsingh/development/project/voice-agent/agent/tracking_llm.py):
+  - `latest_chat_called_at` & `latest_first_token_at`: Captures exact timestamps for stream initiation and first token reception.
+- [`agent/scripts/latency_report.py`](file:///Users/shivamsingh/development/project/voice-agent/agent/scripts/latency_report.py):
+  - `parse_logs()`: Deduplicates log records by `(call_id, turn_idx)`.
+  - `compute_stats()` & `percentile()`: Pure linear interpolation percentiles (no external numpy dependency).
+  - `generate_report()`: Generates clean, numbers-only Markdown tables.
+
+### (d) Likely Reviewer Questions & Short Answers
+1. **Why can the STT-to-LLM delta (`stt_to_llm_ms`) be negative, and why do we not clamp it to zero?**
+   - *Answer*: LiveKit Agents supports speculative/preemptive generation (`turn_handling.preemptive_generation.enabled = True`). When preflight transcripts or interim STT results arrive while the user is pausing, the agent can dispatch the LLM query speculatively before the final VAD end-of-speech window completes. If the final STT confirms the speculation, the LLM first token arrives earlier than `stt_final`. Clamping negative values would artificially distort the cumulative turn latency and obscure the performance benefit of speculative execution.
+2. **Why are "TTS first audio" and "audio published" reported as two distinct stages?**
+   - *Answer*: "TTS first audio" (`started_forwarding_at`) is the moment the external TTS service (e.g. Deepgram Aura) streams the first synthesized PCM audio buffer over WebSocket. "Audio published" (`started_speaking_at`) is the moment the worker's audio pipeline resamples that frame (e.g., from 24kHz/48kHz mono to WebRTC track format) and pushes it to LiveKit's WebRTC audio source via `capture_frame()`. The gap between them reflects local software pipeline latency and audio ring-buffer priming (`playback_latency`).
+3. **What latency components are inherently unobservable to the agent worker?**
+   - *Answer*: The worker cannot observe physical acoustic and client-side device latency. Specifically: (1) client microphone hardware acquisition and OS audio daemon buffer latency, (2) browser WebRTC jitter buffer delay, and (3) browser WebRTC audio decoding and DAC/speaker playback latency. The headline metric (`user_stopped -> audio_published`) represents server-side pipeline latency.
+
+### (e) Decisions & Tradeoffs
+- **Deduplication by `(call_id, turn_idx)`**: Prevents duplicate log ingestion if logs from multiple restarts or re-read sweeps are parsed.
+- **Greeting Isolation**: Initial greeting latency (`join -> first greeting audio`) is separated from conversational turns so that cold-start overhead (worker initialization, model loading, WebRTC track subscription) does not skew conversational turn percentiles (median/p95).
+- **Zero Behavior Change**: Instrumentation is completely passive. All timestamps and metrics are captured via existing event callbacks and stream monitors with zero asynchronous blocking or overhead on real-time audio playback.
+
+### (f) Known Gaps
+- **Client-Side Playout Timing**: Accurate end-to-end user-perceived acoustic latency requires client-side feedback (e.g. measuring `WebRTC.getStats()` audio output playout timestamps in the browser).
