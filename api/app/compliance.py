@@ -21,10 +21,12 @@ from app import config, storage
 
 logger = logging.getLogger(__name__)
 
-# Rule 1 Regex: requires call/conversation context in the same sentence as record(ed|ing)
-# The [^.!?]* ensures that the context word and the record word appear in the same sentence.
+# Rule 1 Regex: requires call/conversation context in the same sentence as record(ed|ing),
+# and rejects negations (e.g. not, never, no, isn't, etc.) before record.
 RECORDING_NOTICE_REGEX = re.compile(
-    r"(?i)\b(?:call|calls|conversation)\b[^.!?]*\brecord(?:ed|ing)\b|\brecord(?:ed|ing)\b[^.!?]*\b(?:call|calls|conversation)\b"
+    r"(?:^|[\n.!?])\s*(?:(?!\b(?:not|never|no|isn't|aren't|won't|cannot|can't)\b)[^.!?])*?\b(?:call|calls|conversation)\b(?:(?!\b(?:not|never|no|isn't|aren't|won't|cannot|can't)\b)[^.!?])*?\brecord(?:ed|ing)\b|"
+    r"(?:^|[\n.!?])\s*(?:(?!\b(?:not|never|no|isn't|aren't|won't|cannot|can't)\b)[^.!?])*?\brecord(?:ed|ing)\b(?:(?!\b(?:not|never|no|isn't|aren't|won't|cannot|can't)\b)[^.!?])*?\b(?:call|calls|conversation)\b",
+    re.IGNORECASE,
 )
 
 
@@ -219,6 +221,7 @@ async def evaluate_refund_promise(
         "Content-Type": "application/json",
     }
 
+    use_json_format = True
     max_attempts = 3
     last_error = "Unknown error"
 
@@ -226,26 +229,38 @@ async def evaluate_refund_promise(
     http_client = client if client is not None else httpx.AsyncClient(timeout=20.0)
 
     try:
-        for attempt in range(1, max_attempts + 1):
-            req_body = {
+        attempt = 1
+        while attempt <= max_attempts:
+            req_body: dict[str, Any] = {
                 "model": config.COMPLIANCE_MODEL,
                 "messages": messages,
                 "temperature": 0,
-                "response_format": {"type": "json_object"},
+                "max_tokens": 1024,
             }
+            if use_json_format:
+                req_body["response_format"] = {"type": "json_object"}
 
             try:
                 response = await http_client.post(groq_url, headers=headers, json=req_body)
             except Exception as exc:
                 last_error = f"HTTP request failed: {exc}"
                 logger.warning("Groq request exception on attempt %d: %s", attempt, exc)
+                attempt += 1
+                continue
+
+            # If Groq returns 400 with response_format json_object, retry once without response_format
+            if response.status_code == 400 and use_json_format:
+                logger.warning("Groq returned 400 with response_format json_object; retrying without response_format")
+                use_json_format = False
                 continue
 
             if response.status_code != 200:
                 last_error = f"Groq HTTP {response.status_code}: {response.text}"
                 logger.warning("Groq non-200 response on attempt %d: %s", attempt, last_error)
+                attempt += 1
                 continue
 
+            attempt += 1
             try:
                 data = response.json()
                 raw_content = data["choices"][0]["message"]["content"]

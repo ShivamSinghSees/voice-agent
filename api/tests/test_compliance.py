@@ -148,11 +148,39 @@ def test_rule1_regex_negative_sentence_context():
     lines3 = [{
         "seq": 0,
         "speaker": "agent",
-        "text": "Thank you for the phone call. I will record your ticket details now.",
+        "text": "Thanks for calling. I'm recording your complaint now.",
         "started_at": "2026-10-21T10:00:02.000000Z",
         "ended_at": "2026-10-21T10:00:05.000000Z",
     }]
     assert evaluate_recording_notice(call, lines3)["passed"] is False
+
+    # 4. Explicit negations before record
+    lines4 = [{
+        "seq": 0,
+        "speaker": "agent",
+        "text": "Please be aware that this call is not being recorded.",
+        "started_at": "2026-10-21T10:00:02.000000Z",
+        "ended_at": "2026-10-21T10:00:05.000000Z",
+    }]
+    assert evaluate_recording_notice(call, lines4)["passed"] is False
+
+    lines5 = [{
+        "seq": 0,
+        "speaker": "agent",
+        "text": "This conversation is never recorded under any circumstances.",
+        "started_at": "2026-10-21T10:00:02.000000Z",
+        "ended_at": "2026-10-21T10:00:05.000000Z",
+    }]
+    assert evaluate_recording_notice(call, lines5)["passed"] is False
+
+    lines6 = [{
+        "seq": 0,
+        "speaker": "agent",
+        "text": "We are not recording this call today.",
+        "started_at": "2026-10-21T10:00:02.000000Z",
+        "ended_at": "2026-10-21T10:00:05.000000Z",
+    }]
+    assert evaluate_recording_notice(call, lines6)["passed"] is False
 
 
 def test_agent_ended_at_clamped_to_call_ended_at():
@@ -336,6 +364,43 @@ async def test_rule2_persistent_invalid_stores_error():
         assert res["status"] == "error"
         assert res["passed"] is None
         assert mock_post.call_count == 3
+
+
+@pytest.mark.anyio
+async def test_rule2_retry_on_400_without_response_format():
+    transcript = [
+        {"seq": 0, "speaker": "agent", "text": "Hello, how can I help?"},
+        {"seq": 1, "speaker": "user", "text": "Can I get a refund?"},
+        {"seq": 2, "speaker": "agent", "text": "I can't issue refunds under our company policy."},
+    ]
+
+    resp_400 = httpx.Response(
+        400,
+        text="response_format type json_object not supported for this model",
+        request=httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions"),
+    )
+    valid_resp = httpx.Response(
+        200,
+        json={"choices": [{"message": {"content": json.dumps({
+            "passed": True,
+            "offending_seq": None,
+            "offending_text": None,
+            "reason": "Agent refused refund.",
+        })}}]},
+        request=httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions"),
+    )
+
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock, side_effect=[resp_400, valid_resp]) as mock_post:
+        res = await evaluate_refund_promise(transcript)
+        assert res["status"] == "done"
+        assert res["passed"] is True
+        # Verify first call had response_format and second call dropped it
+        first_call_body = mock_post.call_args_list[0].kwargs["json"]
+        second_call_body = mock_post.call_args_list[1].kwargs["json"]
+        assert "response_format" in first_call_body
+        assert "response_format" not in second_call_body
+        assert first_call_body["max_tokens"] == 1024
+        assert second_call_body["max_tokens"] == 1024
 
 
 # --- Plumbing & Idempotency Tests ---

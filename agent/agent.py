@@ -375,7 +375,13 @@ async def entrypoint(ctx: JobContext) -> None:
     # Wait until customer disconnects or session closes
     await disconnect_fut
 
-    # Await any pending transcript writes before posting ended to prevent race conditions
+    # 1. Flush / close the session to finalize any in-flight conversation turns
+    try:
+        await session.aclose()
+    except Exception as exc:
+        logger.warning("Error during session aclose: %s", exc)
+
+    # 2. Await pending transcript tasks (done-callback removes finished ones) before posting ended
     if pending_transcript_tasks:
         logger.info("Awaiting %d pending transcript write tasks before finalizing call", len(pending_transcript_tasks))
         await asyncio.gather(*list(pending_transcript_tasks), return_exceptions=True)
@@ -383,7 +389,7 @@ async def entrypoint(ctx: JobContext) -> None:
     ended_at_iso = _format_iso(datetime.now(timezone.utc))
     logger.info("Call session ended for call_id=%s at %s", call_id, ended_at_iso)
 
-    # 12. Finalize Call in Backend
+    # 3. Finalize Call in Backend
     try:
         await api_client.mark_call_ended(call_id=call_id, ended_at=ended_at_iso)
     except Exception as exc:
