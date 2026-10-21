@@ -535,6 +535,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 mode="vad",
             ),
         ),
+        aec_warmup_duration=0.5,
     )
 
     # 7. Transcript, Interruption, and Latency Tracking State
@@ -719,6 +720,7 @@ async def entrypoint(ctx: JobContext) -> None:
             "[SESSION_CONFIG] %s",
             json.dumps({
                 "call_id": call_id,
+                "aec_warmup_duration": getattr(opts, "aec_warmup_duration", None),
                 "turn_detection": td_repr,
                 "interruption": {
                     "enabled": intr.get("enabled"),
