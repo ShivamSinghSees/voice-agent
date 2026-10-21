@@ -1,0 +1,32 @@
+### AgentSession Configuration
+- allow_interruptions: True
+- min_interruption_duration: 0.5s
+- min_interruption_words: 0
+- turn_detection: EnglishModel(model=en, provider=livekit)
+- vad: VAD
+- endpointing: min_delay=0.5s, max_delay=3.0s
+
+### Conversational Turn Latency (Excluding Greeting, N = 24)
+| Stage | Metric Label | Min (ms) | Median (ms) | P95 (ms) | Max (ms) |
+|---|---|---|---|---|---|
+| User Stopped -> STT Final | transcription_delay (framework-clamped) | 0.0 | 379.9 | 551.0 | 791.7 |
+| STT Final -> LLM 1st Token | llm_node_ttft (duration / raw delta) | -311.9 | 200.4 | 2476.8 | 3664.9 |
+| TTS Start -> TTS 1st Audio Buffer | tts_node_ttfb (TTS-start based, not LLM 1st token) | 294.2 | 336.9 | 2405.1 | 3629.9 |
+| TTS 1st Audio -> Audio Published | playback_latency (derived) | 0.1 | 0.3 | 0.9 | 1.4 |
+| **Headline: User Stopped -> Audio Published** | **e2e_latency (headline)** | 902.8 | 1026.3 | 3459.9 | 4355.7 |
+
+- preemptive_generation used: 1 turns
+- interrupted: 4 turns
+
+### Initial Greeting Playout (N = 3)
+| Metric | Min (ms) | Median (ms) | P95 (ms) | Max (ms) |
+|---|---|---|---|---|
+| Join -> First Greeting Audio | 2957.7 | 3069.4 | 3072.6 | 3073.0 |
+
+### Interruption Latency (N = 3)
+| Stage | Min (ms) | Median (ms) | P95 (ms) | Max (ms) |
+|---|---|---|---|---|
+| User Speech Onset -> Interruption Event | 1886.9 | 1936.6 | 2660.2 | 2740.7 |
+| Interruption Event -> Playout Stop (estimated) | 2.2 | 3.9 | 5.2 | 5.3 |
+| Total Interruption Latency | 1892.2 | 1940.4 | 2662.6 | 2742.9 |
+
