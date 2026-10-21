@@ -375,6 +375,9 @@ async def entrypoint(ctx: JobContext) -> None:
     # Wait until customer disconnects or session closes
     await disconnect_fut
 
+    # Capture ended_at the exact moment customer disconnects (before aclose/gather)
+    ended_at_iso = _format_iso(datetime.now(timezone.utc))
+
     # 1. Flush / close the session to finalize any in-flight conversation turns
     try:
         await session.aclose()
@@ -386,7 +389,6 @@ async def entrypoint(ctx: JobContext) -> None:
         logger.info("Awaiting %d pending transcript write tasks before finalizing call", len(pending_transcript_tasks))
         await asyncio.gather(*list(pending_transcript_tasks), return_exceptions=True)
 
-    ended_at_iso = _format_iso(datetime.now(timezone.utc))
     logger.info("Call session ended for call_id=%s at %s", call_id, ended_at_iso)
 
     # 3. Finalize Call in Backend

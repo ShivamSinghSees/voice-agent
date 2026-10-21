@@ -183,6 +183,36 @@ def test_rule1_regex_negative_sentence_context():
     assert evaluate_recording_notice(call, lines6)["passed"] is False
 
 
+def test_rule1_negative_cases_from_user_spec():
+    call = {"started_at": "2026-10-21T10:00:00.000000Z"}
+
+    # 1. "Thanks for calling. I'm recording your complaint now." -> FAIL
+    res1 = evaluate_recording_notice(
+        call,
+        [{
+            "seq": 0,
+            "speaker": "agent",
+            "text": "Thanks for calling. I'm recording your complaint now.",
+            "started_at": "2026-10-21T10:00:02.000000Z",
+            "ended_at": "2026-10-21T10:00:05.000000Z",
+        }],
+    )
+    assert res1["passed"] is False
+
+    # 2. "this call is not being recorded" -> FAIL
+    res2 = evaluate_recording_notice(
+        call,
+        [{
+            "seq": 0,
+            "speaker": "agent",
+            "text": "this call is not being recorded",
+            "started_at": "2026-10-21T10:00:02.000000Z",
+            "ended_at": "2026-10-21T10:00:05.000000Z",
+        }],
+    )
+    assert res2["passed"] is False
+
+
 def test_agent_ended_at_clamped_to_call_ended_at():
     call_id = "test-clamp-call"
     agent_id = "test-agent"
