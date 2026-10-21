@@ -37,3 +37,6 @@ CORS_ORIGINS = [origin.strip() for origin in _cors_raw.split(",") if origin.stri
 # Constant Agent Name for Explicit Dispatch in LiveKit
 # The Python LiveKit worker in Phase 3 registers with this exact name.
 AGENT_NAME = "support-agent"
+
+# LLM Model used for Post-Call Compliance Checking
+COMPLIANCE_MODEL = os.getenv("COMPLIANCE_MODEL", "qwen/qwen3.8-27b")

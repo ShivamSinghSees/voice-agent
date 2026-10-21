@@ -43,6 +43,28 @@ class TranscriptLineResponse(BaseModel):
     ended_at: str
 
 
+class RecordingNoticeResult(BaseModel):
+    passed: bool
+    evidence_seq: Optional[int] = None
+    offset_seconds: Optional[float] = None
+    reason: str
+
+
+class RefundPromiseResult(BaseModel):
+    status: Literal["done", "error"]
+    passed: Optional[bool] = None
+    offending_seq: Optional[int] = None
+    offending_text: Optional[str] = None
+    reason: str
+
+
+class CallComplianceResponse(BaseModel):
+    status: Literal["pending", "done", "error"]
+    recording_notice: Optional[RecordingNoticeResult] = None
+    refund_promise: Optional[RefundPromiseResult] = None
+    checked_at: Optional[str] = None
+
+
 class CallResponse(BaseModel):
     id: str
     agent_id: str
@@ -51,7 +73,7 @@ class CallResponse(BaseModel):
     started_at: Optional[str] = None
     ended_at: Optional[str] = None
     transcript: Optional[list[TranscriptLineResponse]] = None
-    compliance: Optional[dict] = None  # Placeholder for Phase 6
+    compliance: Optional[CallComplianceResponse] = None
 
 
 class CallSummaryResponse(BaseModel):

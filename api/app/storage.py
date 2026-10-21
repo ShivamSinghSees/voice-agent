@@ -4,7 +4,9 @@ This is the ONLY module in the API service that interacts with the SQLite databa
 All queries are parameterized to prevent SQL injection. Foreign keys and WAL mode are enabled.
 """
 
+import json
 import sqlite3
+from datetime import datetime
 from typing import Any, Optional
 
 
@@ -40,7 +42,8 @@ def init_db(db_path: str) -> None:
                 status TEXT NOT NULL CHECK(status IN ('created', 'active', 'ended', 'failed')),
                 created_at TEXT NOT NULL,
                 started_at TEXT,
-                ended_at TEXT
+                ended_at TEXT,
+                compliance TEXT
             );
 
             CREATE TABLE IF NOT EXISTS transcript_lines (
@@ -58,6 +61,12 @@ def init_db(db_path: str) -> None:
             CREATE INDEX IF NOT EXISTS idx_transcript_call_seq ON transcript_lines(call_id, seq);
             """
         )
+
+        # Ensure compliance column exists on existing installations
+        cursor = conn.execute("PRAGMA table_info(calls);")
+        columns = [row["name"] for row in cursor.fetchall()]
+        if "compliance" not in columns:
+            conn.execute("ALTER TABLE calls ADD COLUMN compliance TEXT;")
 
 
 # --- Agent Storage Functions ---
@@ -140,7 +149,7 @@ def create_call(
 def get_call(db_path: str, call_id: str) -> Optional[dict[str, Any]]:
     with get_connection(db_path) as conn:
         cursor = conn.execute(
-            "SELECT id, agent_id, room_name, status, created_at, started_at, ended_at FROM calls WHERE id = ?;",
+            "SELECT id, agent_id, room_name, status, created_at, started_at, ended_at, compliance FROM calls WHERE id = ?;",
             (call_id,),
         )
         row = cursor.fetchone()
@@ -162,7 +171,7 @@ def list_calls(db_path: str, status: Optional[str] = None) -> list[dict[str, Any
         if status:
             cursor = conn.execute(
                 """
-                SELECT c.id, c.agent_id, a.name AS agent_name, c.room_name, c.status, c.created_at, c.started_at, c.ended_at
+                SELECT c.id, c.agent_id, a.name AS agent_name, c.room_name, c.status, c.created_at, c.started_at, c.ended_at, c.compliance
                 FROM calls c
                 LEFT JOIN agents a ON c.agent_id = a.id
                 WHERE c.status = ?
@@ -173,7 +182,7 @@ def list_calls(db_path: str, status: Optional[str] = None) -> list[dict[str, Any
         else:
             cursor = conn.execute(
                 """
-                SELECT c.id, c.agent_id, a.name AS agent_name, c.room_name, c.status, c.created_at, c.started_at, c.ended_at
+                SELECT c.id, c.agent_id, a.name AS agent_name, c.room_name, c.status, c.created_at, c.started_at, c.ended_at, c.compliance
                 FROM calls c
                 LEFT JOIN agents a ON c.agent_id = a.id
                 ORDER BY c.created_at DESC;
@@ -205,23 +214,43 @@ def set_call_started(db_path: str, call_id: str, started_at: str) -> Optional[di
     return get_call(db_path, call_id)
 
 
-def set_call_ended(db_path: str, call_id: str, ended_at: str) -> Optional[dict[str, Any]]:
-    """Idempotently set call to ended status and record ended_at.
+def transition_call_to_ended(
+    db_path: str, call_id: str, ended_at: str, initial_compliance_json: Optional[str] = None
+) -> tuple[Optional[dict[str, Any]], bool]:
+    """Atomically transitions call to 'ended' if not already ended.
 
-    NOTE: This is the single central function that transitions a call to 'ended'.
-    Phase 6 post-call compliance verification will hook in directly after this transition.
+    Returns (call_dict, was_transitioned).
+    was_transitioned is True if and only if cursor.rowcount == 1, ensuring idempotent scheduling.
     """
     with get_connection(db_path) as conn:
-        conn.execute(
+        cursor = conn.execute(
             """
             UPDATE calls
             SET status = 'ended',
-                ended_at = COALESCE(ended_at, ?)
-            WHERE id = ?;
+                ended_at = COALESCE(ended_at, ?),
+                compliance = COALESCE(compliance, ?)
+            WHERE id = ? AND status != 'ended';
             """,
-            (ended_at, call_id),
+            (ended_at, initial_compliance_json, call_id),
         )
-    return get_call(db_path, call_id)
+        was_transitioned = (cursor.rowcount == 1)
+    call = get_call(db_path, call_id)
+    return call, was_transitioned
+
+
+def set_call_ended(db_path: str, call_id: str, ended_at: str) -> Optional[dict[str, Any]]:
+    """Idempotently set call to ended status and record ended_at."""
+    call, _ = transition_call_to_ended(db_path, call_id, ended_at)
+    return call
+
+
+def update_call_compliance(db_path: str, call_id: str, compliance_data: dict[str, Any]) -> None:
+    """Persist the evaluated compliance result JSON to calls.compliance."""
+    with get_connection(db_path) as conn:
+        conn.execute(
+            "UPDATE calls SET compliance = ? WHERE id = ?;",
+            (json.dumps(compliance_data), call_id),
+        )
 
 
 # --- Transcript Storage Functions ---
@@ -253,7 +282,31 @@ def upsert_transcript_lines(db_path: str, call_id: str, lines: list[dict[str, An
         )
 
 
-def get_transcript_lines(db_path: str, call_id: str) -> list[dict[str, Any]]:
+def clamp_agent_transcript_lines(db_path: str, call_id: str, call_ended_at: str) -> None:
+    """Clamps any agent transcript line ended_at to the call ended_at in SQLite."""
+    try:
+        call_ended_dt = datetime.fromisoformat(call_ended_at)
+    except Exception:
+        return
+
+    with get_connection(db_path) as conn:
+        cursor = conn.execute(
+            "SELECT seq, ended_at FROM transcript_lines WHERE call_id = ? AND speaker = 'agent';",
+            (call_id,),
+        )
+        for row in cursor.fetchall():
+            try:
+                line_ended_dt = datetime.fromisoformat(row["ended_at"])
+                if line_ended_dt > call_ended_dt:
+                    conn.execute(
+                        "UPDATE transcript_lines SET ended_at = ? WHERE call_id = ? AND seq = ?;",
+                        (call_ended_at, call_id, row["seq"]),
+                    )
+            except Exception:
+                pass
+
+
+def get_transcript_lines(db_path: str, call_id: str, clamp_to_call_ended: bool = True) -> list[dict[str, Any]]:
     with get_connection(db_path) as conn:
         cursor = conn.execute(
             """
@@ -264,4 +317,20 @@ def get_transcript_lines(db_path: str, call_id: str) -> list[dict[str, Any]]:
             """,
             (call_id,),
         )
-        return [dict(row) for row in cursor.fetchall()]
+        lines = [dict(row) for row in cursor.fetchall()]
+
+    if clamp_to_call_ended and lines:
+        call = get_call(db_path, call_id)
+        if call and call.get("ended_at"):
+            call_ended_iso = call["ended_at"]
+            try:
+                call_ended_dt = datetime.fromisoformat(call_ended_iso)
+                for line in lines:
+                    if line["speaker"] == "agent" and line.get("ended_at"):
+                        line_ended_dt = datetime.fromisoformat(line["ended_at"])
+                        if line_ended_dt > call_ended_dt:
+                            line["ended_at"] = call_ended_iso
+            except Exception:
+                pass
+
+    return lines

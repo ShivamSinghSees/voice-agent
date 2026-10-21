@@ -172,6 +172,12 @@ async def entrypoint(ctx: JobContext) -> None:
     # 7. Transcript and Interruption Tracking State
     transcript_seq = 0
     transcript_lock = asyncio.Lock()
+    pending_transcript_tasks: set[asyncio.Task[None]] = set()
+
+    def _schedule_transcript_write(coro: Any) -> None:
+        task = asyncio.create_task(coro)
+        pending_transcript_tasks.add(task)
+        task.add_done_callback(pending_transcript_tasks.discard)
 
     async def _record_transcript_line(speaker: str, text: str, started_at: str, ended_at: str) -> None:
         nonlocal transcript_seq
@@ -243,7 +249,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 )
 
             # Record assistant turn with exact playback timing
-            asyncio.create_task(
+            _schedule_transcript_write(
                 _record_transcript_line(
                     speaker="agent",
                     text=text,
@@ -254,7 +260,7 @@ async def entrypoint(ctx: JobContext) -> None:
 
         elif item.role == "user":
             # Record user turn with speech timing
-            asyncio.create_task(
+            _schedule_transcript_write(
                 _record_transcript_line(
                     speaker="user",
                     text=text,
@@ -368,6 +374,11 @@ async def entrypoint(ctx: JobContext) -> None:
 
     # Wait until customer disconnects or session closes
     await disconnect_fut
+
+    # Await any pending transcript writes before posting ended to prevent race conditions
+    if pending_transcript_tasks:
+        logger.info("Awaiting %d pending transcript write tasks before finalizing call", len(pending_transcript_tasks))
+        await asyncio.gather(*list(pending_transcript_tasks), return_exceptions=True)
 
     ended_at_iso = _format_iso(datetime.now(timezone.utc))
     logger.info("Call session ended for call_id=%s at %s", call_id, ended_at_iso)

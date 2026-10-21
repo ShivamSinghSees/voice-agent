@@ -4,16 +4,17 @@ Implements public endpoints for agent management, call initialization, and call 
 along with internal token-protected endpoints for worker lifecycle notifications.
 """
 
+import json
 import secrets
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 
-from app import config, schemas, storage
+from app import compliance, config, schemas, storage
 from app.livekit_service import LiveKitServiceError, create_operator_token, create_room_and_dispatch
 from seed import seed_demo_agent
 
@@ -199,6 +200,15 @@ async def get_call(call_id: str):
         raw_lines = storage.get_transcript_lines(config.DATABASE_PATH, call_id)
         transcript_data = [schemas.TranscriptLineResponse(**line) for line in raw_lines]
 
+    # Compliance gate: Only expose compliance after call has reached 'ended'
+    compliance_data = None
+    if call["status"] == "ended" and call.get("compliance"):
+        try:
+            raw_compliance = json.loads(call["compliance"])
+            compliance_data = schemas.CallComplianceResponse(**raw_compliance)
+        except Exception:
+            compliance_data = None
+
     return schemas.CallResponse(
         id=call["id"],
         agent_id=call["agent_id"],
@@ -207,7 +217,7 @@ async def get_call(call_id: str):
         started_at=call["started_at"],
         ended_at=call["ended_at"],
         transcript=transcript_data,
-        compliance=None,  # Placeholder for Phase 6
+        compliance=compliance_data,
     )
 
 
@@ -306,17 +316,34 @@ async def upsert_transcript(
 async def mark_call_ended(
     call_id: str,
     payload: schemas.InternalCallEnded,
+    background_tasks: BackgroundTasks,
     _: str = Depends(verify_internal_token),
 ):
     """Idempotent notification from worker when call concludes.
 
-    This triggers status transition to 'ended' and acts as the entrypoint for Phase 6 compliance.
+    Atomically transitions status to 'ended' using UPDATE ... WHERE status != 'ended'.
+    Schedules the compliance evaluation background task only if this call transitioned the record (rowcount == 1).
     """
-    call = storage.get_call(config.DATABASE_PATH, call_id)
-    if not call:
+    initial_compliance = json.dumps({
+        "status": "pending",
+        "recording_notice": None,
+        "refund_promise": None,
+        "checked_at": None,
+    })
+
+    updated_call, transitioned = storage.transition_call_to_ended(
+        config.DATABASE_PATH,
+        call_id,
+        payload.ended_at,
+        initial_compliance_json=initial_compliance,
+    )
+    if not updated_call:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Call '{call_id}' not found",
         )
-    updated = storage.set_call_ended(config.DATABASE_PATH, call_id, payload.ended_at)
-    return {"status": "ended", "call": updated}
+
+    if transitioned:
+        background_tasks.add_task(compliance.run_post_call_compliance, call_id)
+
+    return {"status": "ended", "call": updated_call}
