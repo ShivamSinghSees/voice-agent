@@ -2,7 +2,6 @@ import React, { useState, useEffect, useRef } from 'react';
 import {
   Room,
   RoomEvent,
-  ParticipantKind,
   RemoteTrack,
   RemoteTrackPublication,
   RemoteParticipant,
@@ -10,8 +9,19 @@ import {
   Track,
   ConnectionState,
 } from 'livekit-client';
-import { Agent, CallState, AgentState, LiveTranscriptItem, CallResponse } from '../types';
+import { Agent, CallState, AgentState, CallResponse } from '../types';
 import { fetchAgents, createCall, getCall } from '../services/api';
+import { useLiveTranscript } from '../hooks/useLiveTranscript';
+import { TranscriptPanel } from '../components/TranscriptPanel';
+import { useCallGuard } from '../context/CallGuardContext';
+
+const STATUS_LABELS: Record<CallState, string> = {
+  idle: 'Ready to call',
+  connecting: 'Connecting...',
+  in_call: 'In call',
+  ended: 'Call ended',
+  error: 'Something went wrong',
+};
 
 export const CustomerCallPage: React.FC = () => {
   // Available agents list loaded from GET /agents
@@ -27,8 +37,8 @@ export const CustomerCallPage: React.FC = () => {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [agentWaitTimeout, setAgentWaitTimeout] = useState<boolean>(false);
 
-  // Live transcript items
-  const [liveTranscript, setLiveTranscript] = useState<LiveTranscriptItem[]>([]);
+  // Live transcript managed via dedicated hook
+  const { lines: liveTranscript, attachRoom, detachRoom, clearTranscript } = useLiveTranscript();
 
   // Persisted call response fetched from API after call finishes
   const [savedCall, setSavedCall] = useState<CallResponse | null>(null);
@@ -37,8 +47,25 @@ export const CustomerCallPage: React.FC = () => {
   // Refs for audio playback and LiveKit Room lifecycle
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const roomRef = useRef<Room | null>(null);
-  const transcriptBoxRef = useRef<HTMLDivElement | null>(null);
   const agentTimeoutTimerRef = useRef<number | null>(null);
+
+  // Navigation-guard support
+  const { setCallActive, registerEndCall } = useCallGuard();
+  // Set in the effect body (not just initialised) so it is correct after StrictMode's remount.
+  const isMountedRef = useRef<boolean>(false);
+  // Bumped by every start/hang-up; lets an in-flight start notice it has been superseded.
+  const callAttemptRef = useRef<number>(0);
+  // Ensures handleCallFinished (and its polling) runs once per call.
+  const finishedCallIdRef = useRef<string | null>(null);
+  // Always points at the latest handleHangUp so the registered callback can stay stable.
+  const hangUpRef = useRef<() => void>(() => {});
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
 
   // Load available agents on initial page mount
   useEffect(() => {
@@ -67,20 +94,14 @@ export const CustomerCallPage: React.FC = () => {
       if (agentTimeoutTimerRef.current) {
         window.clearTimeout(agentTimeoutTimerRef.current);
       }
+      detachRoom();
       if (roomRef.current) {
         console.log('[CALL] Unmounting CustomerCallPage, disconnecting room');
         roomRef.current.disconnect();
         roomRef.current = null;
       }
     };
-  }, []);
-
-  // Auto-scroll live transcript box when new messages arrive
-  useEffect(() => {
-    if (transcriptBoxRef.current) {
-      transcriptBoxRef.current.scrollTop = transcriptBoxRef.current.scrollHeight;
-    }
-  }, [liveTranscript]);
+  }, [detachRoom]);
 
   // Selected agent object
   const currentAgent = agents.find((a) => a.id === selectedAgentId);
@@ -92,20 +113,25 @@ export const CustomerCallPage: React.FC = () => {
     if (!selectedAgentId) return;
 
     // Reset previous call states
+    const attempt = ++callAttemptRef.current;
+    finishedCallIdRef.current = null;
     setErrorMessage(null);
     setAgentWaitTimeout(false);
-    setLiveTranscript([]);
+    clearTranscript();
     setSavedCall(null);
+    setActiveCallId(null);
     setAgentState(null);
     setCallState('connecting');
 
     try {
       console.log(`[CALL] Initiating POST /calls for agent_id=${selectedAgentId}`);
       const callData = await createCall(selectedAgentId);
+      // Hung up or navigated away while the call was being created: do not open a room.
+      if (attempt !== callAttemptRef.current || !isMountedRef.current) return;
       setActiveCallId(callData.call_id);
       console.log(`[CALL] Created call_id=${callData.call_id}, room=${callData.room_name}`);
 
-      // Create a fresh Room instance for this call
+      // 1. Create a fresh Room instance for this call
       const room = new Room({
         audioCaptureDefaults: {
           echoCancellation: true,
@@ -115,7 +141,10 @@ export const CustomerCallPage: React.FC = () => {
       });
       roomRef.current = room;
 
-      // Log public WebRTC connection state changes
+      // 2. Synchronously attach room to register 'lk.transcription' handler BEFORE room.connect()
+      attachRoom(room);
+
+      // 3. Log public WebRTC connection state changes
       room.on(RoomEvent.ConnectionStateChanged, (state: ConnectionState) => {
         console.log(`[WEBRTC] ConnectionStateChanged: ${state}`);
         if (state === ConnectionState.Connected) {
@@ -177,103 +206,16 @@ export const CustomerCallPage: React.FC = () => {
         handleCallFinished(callData.call_id);
       });
 
-      // Register text stream handler for 'lk.transcription' ONCE on this room
-      room.registerTextStreamHandler(
-        'lk.transcription',
-        async (reader, participantInfo: { identity: string }) => {
-          const sender = participantInfo.identity;
-          const remoteParticipant = room.remoteParticipants.get(sender);
-
-          // Identify speaker:
-          // Local participant / customer is 'You'
-          // Agent participant (via ParticipantKind.AGENT or known agent identity) is 'Agent'
-          // Ignore any other participant
-          const isUser =
-            sender === room.localParticipant.identity || sender.startsWith('customer-');
-          const isAgent =
-            (remoteParticipant && remoteParticipant.kind === ParticipantKind.AGENT) ||
-            sender.startsWith('agent-');
-
-          if (!isUser && !isAgent) {
-            console.log(`[TRANSCRIPTION] Ignoring transcription from non-agent/non-user: ${sender}`);
-            return;
-          }
-
-          const speaker: 'You' | 'Agent' = isUser ? 'You' : 'Agent';
-          const segmentId =
-            reader.info.attributes?.['lk.segment_id'] || reader.info.id || Math.random().toString();
-          const isFinalAttribute = reader.info.attributes?.['lk.transcription_final'] === 'true';
-
-          let accumulatedText = '';
-
-          try {
-            // Stream chunks incrementally as yielded by TextStreamReader
-            for await (const chunk of reader) {
-              const timestamp = performance.now();
-              accumulatedText += chunk;
-
-              // Log each individual chunk for verification during barge-in review
-              console.log(
-                `[TRANSCRIPTION CHUNK] t=${timestamp.toFixed(2)}ms | sender=${sender} | segment=${segmentId} | final=${isFinalAttribute} | chunk="${chunk}"`
-              );
-
-              // Update or insert segment in live transcript state
-              setLiveTranscript((prev) => {
-                const existingIndex = prev.findIndex((item) => item.id === segmentId);
-                if (existingIndex >= 0) {
-                  const updated = [...prev];
-                  updated[existingIndex] = {
-                    ...updated[existingIndex],
-                    text: accumulatedText,
-                  };
-                  return updated;
-                } else {
-                  return [
-                    ...prev,
-                    {
-                      id: segmentId,
-                      speaker,
-                      text: accumulatedText,
-                      isFinal: isFinalAttribute,
-                      timestamp,
-                    },
-                  ];
-                }
-              });
-            }
-
-            // Stream ended
-            const endTimestamp = performance.now();
-            console.log(
-              `[TRANSCRIPTION STREAM END] t=${endTimestamp.toFixed(2)}ms | sender=${sender} | segment=${segmentId} | final=${isFinalAttribute} | total="${accumulatedText}"`
-            );
-
-            // Mark segment as final when stream completes
-            setLiveTranscript((prev) => {
-              const existingIndex = prev.findIndex((item) => item.id === segmentId);
-              if (existingIndex >= 0) {
-                const updated = [...prev];
-                updated[existingIndex] = {
-                  ...updated[existingIndex],
-                  text: accumulatedText,
-                  isFinal: true,
-                };
-                return updated;
-              }
-              return prev;
-            });
-          } catch (err: unknown) {
-            console.warn(`[TRANSCRIPTION STREAM ERROR] sender=${sender} | segment=${segmentId}:`, err);
-          }
-        }
-      );
-
-      // Connect to LiveKit server with token
+      // 4. Connect to LiveKit server with token (handler already registered and active)
       console.log(`[WEBRTC] Connecting to ${callData.livekit_url}...`);
       await room.connect(callData.livekit_url, callData.token);
+      if (attempt !== callAttemptRef.current || !isMountedRef.current) {
+        if (room.state !== ConnectionState.Disconnected) room.disconnect();
+        return;
+      }
       console.log('[WEBRTC] Room connected successfully');
 
-      // Enable microphone with echo cancellation
+      // 5. Enable microphone with echo cancellation
       try {
         await room.localParticipant.setMicrophoneEnabled(true, {
           echoCancellation: true,
@@ -298,10 +240,13 @@ export const CustomerCallPage: React.FC = () => {
         }, 20000);
       }
     } catch (err: unknown) {
+      // A hang-up/unmount during connect rejects room.connect(); that is not a failure.
+      if (attempt !== callAttemptRef.current || !isMountedRef.current) return;
+      console.error('[CALL] Failed to start call:', err);
       const message = err instanceof Error ? err.message : String(err);
-      console.error('[CALL] Call initiation failed:', message);
-      setErrorMessage(`Call failed: ${message}`);
+      setErrorMessage(`Call setup failed: ${message}`);
       setCallState('error');
+      detachRoom();
       if (roomRef.current) {
         roomRef.current.disconnect();
         roomRef.current = null;
@@ -314,10 +259,12 @@ export const CustomerCallPage: React.FC = () => {
    */
   const handleHangUp = () => {
     console.log('[CALL] User clicked Hang Up');
+    callAttemptRef.current += 1;
     if (agentTimeoutTimerRef.current) {
       window.clearTimeout(agentTimeoutTimerRef.current);
       agentTimeoutTimerRef.current = null;
     }
+    detachRoom();
     if (roomRef.current) {
       roomRef.current.disconnect();
       roomRef.current = null;
@@ -329,10 +276,36 @@ export const CustomerCallPage: React.FC = () => {
     }
   };
 
+  // Keep the registered end-call callback pointing at the latest handleHangUp.
+  useEffect(() => {
+    hangUpRef.current = handleHangUp;
+  });
+
+  // Register a stable end-call callback with the nav guard; clear it on unmount.
+  useEffect(() => {
+    registerEndCall(() => hangUpRef.current());
+    return () => {
+      registerEndCall(null);
+    };
+  }, [registerEndCall]);
+
+  // Publish "call is active" (connecting or in_call); reset to false on change/unmount.
+  const isCallActive = callState === 'connecting' || callState === 'in_call';
+  useEffect(() => {
+    setCallActive(isCallActive);
+    return () => {
+      setCallActive(false);
+    };
+  }, [isCallActive, setCallActive]);
+
   /**
    * Common handler when call session finishes: polls backend until call status is 'ended'.
+   * Runs once per call: both Hang Up and the room Disconnected event reach this function.
    */
   const handleCallFinished = (callId: string) => {
+    if (!isMountedRef.current) return;
+    if (finishedCallIdRef.current === callId) return;
+    finishedCallIdRef.current = callId;
     setCallState('ended');
     setAgentState(null);
     setAgentWaitTimeout(false);
@@ -340,53 +313,69 @@ export const CustomerCallPage: React.FC = () => {
   };
 
   /**
-   * Poll GET /calls/{id} up to 10 attempts (1 per second) to retrieve persisted transcript.
+   * Poll GET /calls/{id} until status is 'ended' or timeout (up to 30 attempts, 500ms intervals).
+   * Verifies background transcript flushes and compliance checks complete.
    */
   const pollSavedCallTranscript = async (callId: string) => {
+    if (!isMountedRef.current) return;
     setIsPollingSavedCall(true);
     let attempts = 0;
-    const maxAttempts = 10;
+    const maxAttempts = 30;
 
-    const intervalId = window.setInterval(async () => {
-      attempts += 1;
+    const poll = async () => {
       try {
-        const call = await getCall(callId);
-        if (call.status === 'ended' || attempts >= maxAttempts) {
-          window.clearInterval(intervalId);
+        if (!isMountedRef.current) return;
+        attempts += 1;
+        console.log(`[POLL] Fetching GET /calls/${callId} (attempt ${attempts}/${maxAttempts})`);
+        const data = await getCall(callId);
+        if (!isMountedRef.current) return;
+        if (data.status === 'ended') {
+          console.log('[POLL] Call status is "ended", saved transcript loaded:', data.transcript);
+          setSavedCall(data);
           setIsPollingSavedCall(false);
-          setSavedCall(call);
-          console.log('[API] Retrieved finalized call record:', call);
+          return;
         }
-      } catch (pollErr) {
-        console.warn(`[API] Poll attempt ${attempts} failed:`, pollErr);
-        if (attempts >= maxAttempts) {
-          window.clearInterval(intervalId);
+
+        if (attempts < maxAttempts) {
+          setTimeout(poll, 500);
+        } else {
+          console.warn('[POLL] Reached max polling attempts without "ended" status');
+          setSavedCall(data);
           setIsPollingSavedCall(false);
         }
+      } catch (err: unknown) {
+        if (!isMountedRef.current) return;
+        console.error('[POLL] Error fetching call data:', err);
+        setIsPollingSavedCall(false);
       }
-    }, 1000);
+    };
+
+    poll();
   };
 
   return (
     <div className="customer-page">
-      {/* Hidden audio element for LiveKit agent audio playout */}
-      <audio ref={audioRef} autoPlay />
+      {/* Hidden audio element for remote agent audio playout */}
+      <audio ref={audioRef} autoPlay playsInline style={{ display: 'none' }} />
 
-      {/* Error alert banner */}
+      {/* Error and timeout banners */}
       {errorMessage && <div className="error-banner">{errorMessage}</div>}
-
-      {/* Agent timeout alert banner */}
       {agentWaitTimeout && (
         <div className="warning-banner">
-          Waiting for support agent to join room... (No agent worker joined after 20s. Ensure{' '}
-          <code>uv run python agent.py dev</code> is running).
+          Agent worker did not join room within 20 seconds. Ensure the agent worker process is running
+          (<code>cd agent && uv run python agent.py dev</code>).
         </div>
       )}
 
-      {/* Agent Picker & Info Card */}
-      <div className="card">
+      {/* Agent Selector Card */}
+      <div className="card agent-card">
+        <h2 className="card-title">Start a support call</h2>
+        <p className="card-subtitle">
+          Choose an agent, then click Call Agent. Allow microphone access when your browser asks.
+        </p>
+
         <div className="agent-picker">
-          <label htmlFor="agent-select">Select Support Agent:</label>
+          <label htmlFor="agent-select">Support agent</label>
           <select
             id="agent-select"
             value={selectedAgentId}
@@ -403,15 +392,18 @@ export const CustomerCallPage: React.FC = () => {
 
         {currentAgent && (
           <div className="agent-details">
-            <div>
-              <strong>Model:</strong> {currentAgent.model}
+            <div className="chip-row">
+              <span className="chip">
+                <span className="chip-label">Model</span> {currentAgent.model}
+              </span>
+              <span className="chip">
+                <span className="chip-label">Voice</span> {currentAgent.voice}
+              </span>
             </div>
-            <div>
-              <strong>Voice:</strong> {currentAgent.voice}
-            </div>
-            <div>
-              <strong>Prompt:</strong> {currentAgent.system_prompt}
-            </div>
+            <details className="prompt-details">
+              <summary>View agent instructions</summary>
+              <p>{currentAgent.system_prompt}</p>
+            </details>
           </div>
         )}
 
@@ -433,45 +425,18 @@ export const CustomerCallPage: React.FC = () => {
             )}
           </div>
 
-          <div className="status-indicator">
-            <span>Status: {callState}</span>
-            {agentState && <span className="state-tag">[Agent: {agentState}]</span>}
+          <div className="status-indicator" role="status">
+            <span className={`status-badge status-${callState}`}>
+              <span className="status-dot" aria-hidden="true" />
+              {STATUS_LABELS[callState]}
+            </span>
+            {agentState && <span className="state-tag">Agent: {agentState}</span>}
           </div>
         </div>
       </div>
 
-      {/* Live Transcript Card */}
-      <div className="card transcript-section">
-        <div className="transcript-header">
-          <span>Live Conversation Transcript</span>
-          {callState === 'in_call' && <span className="state-tag">Active Stream</span>}
-        </div>
-
-        <div className="transcript-box" ref={transcriptBoxRef}>
-          {liveTranscript.length === 0 ? (
-            <div className="empty-transcript">
-              {callState === 'in_call'
-                ? 'Connected. Start speaking into your microphone...'
-                : 'No active call. Select an agent and click "Call Agent" to begin.'}
-            </div>
-          ) : (
-            liveTranscript.map((item) => (
-              <div
-                key={item.id}
-                className={`transcript-line ${item.speaker === 'You' ? 'you' : 'agent'}`}
-              >
-                <span
-                  className={`speaker-label ${item.speaker === 'You' ? 'you-label' : 'agent-label'}`}
-                >
-                  [{item.speaker}]
-                </span>
-                <span>{item.text}</span>
-                {!item.isFinal && <span className="interim-indicator">...</span>}
-              </div>
-            ))
-          )}
-        </div>
-      </div>
+      {/* Live Transcript Panel Component */}
+      <TranscriptPanel items={liveTranscript} callState={callState} />
 
       {/* Persisted Server Transcript Card (Displayed upon call completion) */}
       {savedCall && (

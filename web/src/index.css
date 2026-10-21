@@ -70,34 +70,115 @@ nav a.active {
   margin-bottom: 18px;
 }
 
-/* Agent Picker */
+/* Agent Card */
+.card-title {
+  font-size: 1.15rem;
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+
+.card-subtitle {
+  font-size: 0.9rem;
+  color: var(--text-muted);
+  margin-bottom: 18px;
+}
+
 .agent-picker {
   margin-bottom: 14px;
 }
 
 .agent-picker label {
   display: block;
-  font-size: 0.9rem;
-  font-weight: 500;
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
   margin-bottom: 6px;
   color: var(--text-muted);
 }
 
 .agent-picker select {
   width: 100%;
-  padding: 10px;
+  padding: 11px 40px 11px 14px;
   background-color: #111827;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%239ca3af' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 14px center;
+  background-size: 12px 8px;
+  -webkit-appearance: none;
+  appearance: none;
   color: var(--text-main);
   border: 1px solid var(--border-color);
-  border-radius: 4px;
+  border-radius: 6px;
   font-size: 1rem;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.agent-picker select:focus-visible,
+.prompt-details summary:focus-visible,
+button:focus-visible {
+  outline: 2px solid #60a5fa;
+  outline-offset: 2px;
+}
+
+.agent-picker select:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 .agent-details {
+  margin-top: 4px;
+}
+
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 9999px;
+  background-color: #111827;
+  border: 1px solid var(--border-color);
+  font-size: 0.82rem;
+  color: var(--text-main);
+}
+
+.chip-label {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.prompt-details {
+  margin-top: 12px;
   font-size: 0.85rem;
   color: var(--text-muted);
+}
+
+.prompt-details summary {
+  cursor: pointer;
+  color: #93c5fd;
+  font-weight: 500;
+  width: fit-content;
+}
+
+.prompt-details p {
   margin-top: 8px;
-  line-height: 1.4;
+  padding: 10px 12px;
+  background-color: #111827;
+  border-left: 3px solid var(--border-color);
+  border-radius: 4px;
+  line-height: 1.5;
+  max-height: 180px;
+  overflow-y: auto;
 }
 
 /* Action Controls & Indicators */
@@ -142,8 +223,54 @@ button:disabled {
 }
 
 .status-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-size: 0.95rem;
   font-weight: 500;
+}
+
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px;
+  border-radius: 9999px;
+  background-color: #111827;
+  border: 1px solid var(--border-color);
+  font-size: 0.88rem;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: #9ca3af;
+}
+
+.status-connecting .status-dot {
+  background-color: #fbbf24;
+  animation: status-pulse 1s ease-in-out infinite;
+}
+
+.status-in_call .status-dot {
+  background-color: #34d399;
+  animation: status-pulse 1.6s ease-in-out infinite;
+}
+
+.status-error .status-dot {
+  background-color: #f87171;
+}
+
+@keyframes status-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+.btn-call,
+.btn-hangup {
+  min-width: 150px;
+  padding: 12px 24px;
 }
 
 .state-tag {
@@ -181,6 +308,33 @@ button:disabled {
 .transcript-section {
   display: flex;
   flex-direction: column;
+  position: relative;
+}
+
+.jump-to-latest-btn {
+  position: absolute;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  background-color: var(--primary);
+  color: #ffffff;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 9999px;
+  padding: 6px 14px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  transition: background-color 0.15s ease, transform 0.15s ease;
+}
+
+.jump-to-latest-btn:hover {
+  background-color: var(--primary-hover);
+  transform: translateX(-50%) translateY(-1px);
 }
 
 .transcript-header {
@@ -515,5 +669,55 @@ button:disabled {
 
 .field-hint.warning {
   color: #fca5a5;
+}
+
+/* Leave-call dialog (native <dialog>) */
+.leave-dialog {
+  max-width: 480px;
+  width: calc(100% - 40px);
+  margin: auto;
+  padding: 0;
+  background-color: var(--card-bg);
+  color: var(--text-main);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6);
+}
+
+.leave-dialog::backdrop {
+  background-color: rgba(3, 7, 18, 0.7);
+}
+
+.leave-dialog-body {
+  padding: 22px;
+}
+
+.leave-dialog-title {
+  font-size: 1.2rem;
+  margin-bottom: 10px;
+}
+
+.leave-dialog-text {
+  font-size: 0.92rem;
+  line-height: 1.55;
+  color: var(--text-muted);
+  margin-bottom: 20px;
+}
+
+.leave-dialog-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.btn-secondary {
+  background-color: var(--badge-bg);
+  color: var(--text-main);
+  min-width: 150px;
+  padding: 12px 24px;
+}
+
+.btn-secondary:hover:not(:disabled) {
+  background-color: #4b5563;
 }
 

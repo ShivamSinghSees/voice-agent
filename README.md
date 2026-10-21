@@ -1,3 +1,7 @@
+## Demo recording
+[2 min screen recording: call, barge-in, whisper, compliance result](https://drive.google.com/file/d/1_y3vKhUtkyj61jWSc8nnQlMqMVezmhsC/view?usp=sharing)
+
+
 # Operator-Guided Voice AI Agent
 
 ## 1. Overview
