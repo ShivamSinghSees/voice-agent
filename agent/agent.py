@@ -16,7 +16,8 @@ from typing import Any
 from livekit import rtc
 from livekit.agents import AgentServer, JobContext, cli, llm
 from livekit.agents.voice import Agent, AgentSession, room_io
-from livekit.plugins import deepgram, groq, silero
+from livekit.agents.voice.turn import InterruptionOptions, TurnHandlingOptions
+from livekit.plugins import deepgram, groq, silero, turn_detector
 
 from api_client import APIClient, APIClientError
 import config
@@ -167,6 +168,12 @@ async def entrypoint(ctx: JobContext) -> None:
         tts=tts_plugin,
         llm=tracking_llm,
         vad=vad_plugin,
+        turn_handling=TurnHandlingOptions(
+            turn_detection=turn_detector.english.EnglishModel(),
+            interruption=InterruptionOptions(
+                mode="vad",
+            ),
+        ),
     )
 
     # 7. Transcript, Interruption, and Latency Tracking State
@@ -491,9 +498,54 @@ async def entrypoint(ctx: JobContext) -> None:
         close_on_disconnect=True,
     )
 
-    # Report AgentSession parameters and options
-    opts = session.options
-    turn_handling = opts.turn_handling
+    # Report AgentSession parameters and real effective options
+    try:
+        opts = session.options
+        th = opts.turn_handling
+        ep = opts.endpointing
+        intr = opts.interruption
+        pg = opts.preemptive_generation
+        td = th.get("turn_detection")
+        td_repr = (
+            f"{type(td).__name__}(model={getattr(td, 'model', 'unknown')}, provider={getattr(td, 'provider', 'unknown')})"
+            if td
+            else "None"
+        )
+        logger.info(
+            "[SESSION_CONFIG] %s",
+            json.dumps({
+                "call_id": call_id,
+                "turn_detection": td_repr,
+                "interruption": {
+                    "enabled": intr.get("enabled"),
+                    "mode": intr.get("mode"),
+                    "min_duration": intr.get("min_duration"),
+                    "min_words": intr.get("min_words"),
+                    "resume_false_interruption": intr.get("resume_false_interruption"),
+                    "false_interruption_timeout": intr.get("false_interruption_timeout"),
+                },
+                "endpointing": {
+                    "mode": ep.get("mode"),
+                    "min_delay": ep.get("min_delay"),
+                    "max_delay": ep.get("max_delay"),
+                    "alpha": ep.get("alpha"),
+                },
+                "preemptive_generation": {
+                    "enabled": pg.get("enabled"),
+                    "preemptive_tts": pg.get("preemptive_tts"),
+                    "max_speech_duration": pg.get("max_speech_duration"),
+                    "max_retries": pg.get("max_retries"),
+                },
+                "vad": type(session.vad).__name__ if session.vad else None,
+                "stt": type(session.stt).__name__ if session.stt else None,
+                "tts": type(session.tts).__name__ if session.tts else None,
+                "llm": getattr(session.llm, "model", type(session.llm).__name__ if session.llm else None),
+            }),
+        )
+    except Exception as exc:
+        logger.warning("Failed to emit [SESSION_CONFIG] startup log: %s", exc)
+
+    turn_handling = session.options.turn_handling
     logger.info(
         "AgentSession args: allow_interruptions=%s, min_interruption_duration=%.2f, min_interruption_words=%d, "
         "turn_detection=%s, vad=%s, min_endpointing_delay=%.2f, max_endpointing_delay=%.2f, preemptive_generation=%s",

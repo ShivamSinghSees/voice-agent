@@ -63,10 +63,26 @@ def parse_logs(lines: list[str]) -> dict[str, Any]:
     )
 
     for line in lines:
-        # 1. Parse AgentSession parameters
-        m_sess = session_regex.search(line)
-        if m_sess:
-            session_args = m_sess.groupdict()
+        # 1. Parse AgentSession parameters ([SESSION_CONFIG] or legacy string)
+        if "[SESSION_CONFIG]" in line:
+            raw_json = line[line.index("[SESSION_CONFIG]") + len("[SESSION_CONFIG]") :].strip()
+            try:
+                cfg = json.loads(raw_json)
+                session_args = {
+                    "allow_interruptions": str(cfg.get("interruption", {}).get("enabled")),
+                    "min_interruption_duration": str(cfg.get("interruption", {}).get("min_duration")),
+                    "min_interruption_words": str(cfg.get("interruption", {}).get("min_words")),
+                    "turn_detection": str(cfg.get("turn_detection")),
+                    "vad": str(cfg.get("vad")),
+                    "min_endpointing_delay": str(cfg.get("endpointing", {}).get("min_delay")),
+                    "max_endpointing_delay": str(cfg.get("endpointing", {}).get("max_delay")),
+                }
+            except Exception:
+                pass
+        elif not session_args:
+            m_sess = session_regex.search(line)
+            if m_sess:
+                session_args = m_sess.groupdict()
 
         # 2. Parse Greeting Latency: [LATENCY_GREETING] {json}
         if "[LATENCY_GREETING]" in line:
@@ -168,9 +184,9 @@ def generate_report(parsed: dict[str, Any]) -> str:
             e2e_total.append(float(v))
 
     stages = [
-        ("User Stopped -> STT Final", "transcription_delay (derived)", compute_stats(vad_to_stt)),
+        ("User Stopped -> STT Final", "transcription_delay (framework-clamped)", compute_stats(vad_to_stt)),
         ("STT Final -> LLM 1st Token", "llm_node_ttft (duration / raw delta)", compute_stats(stt_to_llm)),
-        ("LLM 1st Token -> TTS 1st Audio", "tts_node_ttfb (duration / raw delta)", compute_stats(llm_to_tts)),
+        ("TTS Start -> TTS 1st Audio Buffer", "tts_node_ttfb (TTS-start based, not LLM 1st token)", compute_stats(llm_to_tts)),
         ("TTS 1st Audio -> Audio Published", "playback_latency (derived)", compute_stats(tts_to_publish)),
         ("**Headline: User Stopped -> Audio Published**", "**e2e_latency (headline)**", compute_stats(e2e_total)),
     ]
@@ -220,7 +236,7 @@ def generate_report(parsed: dict[str, Any]) -> str:
 
     int_stages = [
         ("User Speech Onset -> Interruption Event", compute_stats(onset_to_event)),
-        ("Interruption Event -> Playout Stop", compute_stats(event_to_stop)),
+        ("Interruption Event -> Playout Stop (estimated)", compute_stats(event_to_stop)),
         ("Total Interruption Latency", compute_stats(total_interrupt)),
     ]
     lines.append("| Stage | Min (ms) | Median (ms) | P95 (ms) | Max (ms) |")
