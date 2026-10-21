@@ -11,6 +11,7 @@ from pathlib import Path
 
 # Add scripts directory to path for import
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+from livekit.agents import llm
 from latency_report import compute_stats, generate_report, parse_logs, percentile
 from tracking_llm import TrackingLLM
 
@@ -120,3 +121,81 @@ async def test_tracking_llm_timing():
     assert tracker.latest_first_token_at is not None
     assert tracker.latest_first_token_at >= tracker.latest_chat_called_at
     assert tracker.latest_full_text == "Hello world!"
+
+
+def test_conversation_item_failsafe_latency_does_not_block_transcript():
+    """Verify that exceptions raised in the latency measurement block do not prevent transcript writes."""
+    from agent import handle_conversation_item
+
+    mock_write = MagicMock()
+    mock_record = MagicMock(return_value="coro_placeholder")
+
+    # Force a failure inside the latency measurement block (e.g. tracking_llm explodes)
+    mock_tracker = MagicMock()
+    type(mock_tracker).latest_full_text = property(
+        lambda self: (_ for _ in ()).throw(RuntimeError("Simulated latency block explosion"))
+    )
+
+    item = llm.ChatMessage(
+        role="assistant",
+        content=["To clarify, Acme Telecom provides communication services."],
+        interrupted=True,
+    )
+
+    state = {
+        "agent_turn_idx": 1,
+        "last_user_turn_metrics": {"stopped_speaking_at": 100.0, "transcription_delay": 0.5},
+        "last_user_turn_text": "What is your policy?",
+    }
+
+    # Execute handler - must NOT raise
+    handle_conversation_item(
+        item,
+        call_id="call-4faf5922",
+        transcript_state=state,
+        schedule_transcript_write=mock_write,
+        record_transcript_line=mock_record,
+        tracking_llm=mock_tracker,
+    )
+
+    # Transcript line was recorded FIRST and INDEPENDENTLY
+    mock_record.assert_called_once()
+    assert mock_record.call_args.kwargs["speaker"] == "agent"
+    assert mock_record.call_args.kwargs["text"] == "To clarify, Acme Telecom provides communication services."
+    mock_write.assert_called_once_with("coro_placeholder")
+
+    # State was still cleaned up
+    assert state["last_user_turn_metrics"] == {}
+
+
+def test_user_turn_failsafe_latency_does_not_block_transcript():
+    """Verify that user turn transcript write succeeds even if metrics fail."""
+    from agent import handle_conversation_item
+
+    mock_write = MagicMock()
+    mock_record = MagicMock(return_value="coro_placeholder")
+
+    item = llm.ChatMessage(
+        role="user",
+        content=["I need help with my account."],
+    )
+
+    state = {
+        "agent_turn_idx": 0,
+        "last_user_turn_metrics": {},
+        "last_user_turn_text": "",
+    }
+
+    handle_conversation_item(
+        item,
+        call_id="call-4faf5922",
+        transcript_state=state,
+        schedule_transcript_write=mock_write,
+        record_transcript_line=mock_record,
+    )
+
+    mock_record.assert_called_once()
+    assert mock_record.call_args.kwargs["speaker"] == "user"
+    assert mock_record.call_args.kwargs["text"] == "I need help with my account."
+    mock_write.assert_called_once_with("coro_placeholder")
+

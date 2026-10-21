@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 import json
 import logging
 import sys
+import time
 from typing import Any
 
 from livekit import rtc
@@ -47,6 +48,270 @@ def _format_iso(dt: datetime | None) -> str:
         dt = dt.replace(tzinfo=timezone.utc)
     dt = dt.astimezone(timezone.utc)
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+
+
+def handle_conversation_item(
+    item: Any,
+    *,
+    call_id: str,
+    transcript_state: dict[str, Any],
+    schedule_transcript_write: Any,
+    record_transcript_line: Any,
+    tracking_llm: Any = None,
+    disconnect_fut: Any = None,
+    customer_joined_at: datetime | None = None,
+    worker_saw_at: datetime | None = None,
+    chat_ctx_items: list[Any] | None = None,
+) -> None:
+    """Handle conversation item with guaranteed decoupled transcript write before latency instrumentation.
+
+    All latency and interruption logging is executed strictly after the transcript record call
+    and wrapped in try/except blocks to ensure instrumentation failures can never drop transcript
+    records or disrupt the active voice session.
+    """
+    if not isinstance(item, llm.ChatMessage):
+        return
+
+    # Explicitly filter to user and assistant roles only; drop internal guidance / whispers
+    if item.role not in ("assistant", "user") or (getattr(item, "extra", None) or {}).get("whisper"):
+        return
+
+    text = item.text_content
+    metrics = getattr(item, "metrics", None) or {}
+
+    started_speaking_at = metrics.get("started_speaking_at")
+    stopped_speaking_at = metrics.get("stopped_speaking_at")
+
+    if started_speaking_at is not None:
+        started_at_dt = datetime.fromtimestamp(started_speaking_at, tz=timezone.utc)
+    elif getattr(item, "created_at", None) is not None:
+        started_at_dt = datetime.fromtimestamp(item.created_at, tz=timezone.utc)
+    else:
+        started_at_dt = datetime.now(timezone.utc)
+
+    if stopped_speaking_at is not None:
+        ended_at_dt = datetime.fromtimestamp(stopped_speaking_at, tz=timezone.utc)
+    else:
+        ended_at_dt = datetime.now(timezone.utc)
+
+    started_at_iso = _format_iso(started_at_dt)
+    ended_at_iso = _format_iso(ended_at_dt)
+
+    if item.role == "user":
+        # 1. Record user turn transcript first and independently
+        schedule_transcript_write(
+            record_transcript_line(
+                speaker="user",
+                text=text,
+                started_at=started_at_iso,
+                ended_at=ended_at_iso,
+            )
+        )
+
+        # 2. Save user turn metrics for subsequent assistant turn latency correlation (fail-safe)
+        try:
+            transcript_state["last_user_turn_metrics"] = dict(metrics)
+            transcript_state["last_user_turn_text"] = text
+        except Exception as exc:
+            logger.warning("Failed saving user turn metrics: %s", exc)
+
+    elif item.role == "assistant":
+        transcript_state["agent_turn_idx"] = transcript_state.get("agent_turn_idx", 0) + 1
+        agent_turn_idx = transcript_state["agent_turn_idx"]
+        is_interrupted = bool(getattr(item, "interrupted", False))
+
+        # 1. Record assistant turn transcript write FIRST and INDEPENDENTLY
+        schedule_transcript_write(
+            record_transcript_line(
+                speaker="agent",
+                text=text,
+                started_at=started_at_iso,
+                ended_at=ended_at_iso,
+            )
+        )
+
+        # 2. Interruption debug and latency tracking (fail-safe)
+        if is_interrupted:
+            try:
+                interruption_ts = _format_iso(datetime.now(timezone.utc))
+                latest_text = getattr(tracking_llm, "latest_full_text", "") if tracking_llm else ""
+                logger.info(
+                    "[INTERRUPTION_DEBUG] Barge-in detected at %s! "
+                    "FULL LLM generated: %r | KEPT in history/transcript: %r",
+                    interruption_ts,
+                    latest_text,
+                    text,
+                )
+                disconnect_done = disconnect_fut.done() if disconnect_fut else False
+                if not disconnect_done:
+                    t_onset = transcript_state.get("user_speech_onset_time")
+                    t_event = transcript_state.get("interruption_event_time") or time.time()
+                    t_stop = stopped_speaking_at or time.time()
+                    if t_onset is None:
+                        t_onset = t_event - 0.5
+                    onset_to_event_ms = (t_event - t_onset) * 1000.0
+                    event_to_stop_ms = (t_stop - t_event) * 1000.0
+                    total_interrupt_ms = (t_stop - t_onset) * 1000.0
+                    logger.info(
+                        "[INTERRUPT_LATENCY] %s",
+                        json.dumps({
+                            "call_id": call_id,
+                            "turn_idx": agent_turn_idx,
+                            "timestamps": {
+                                "user_speech_onset": t_onset,
+                                "interruption_event": t_event,
+                                "playout_stop": t_stop,
+                            },
+                            "deltas_ms": {
+                                "onset_to_event": round(onset_to_event_ms, 2),
+                                "event_to_stop": round(event_to_stop_ms, 2),
+                                "total_interruption_latency": round(total_interrupt_ms, 2),
+                            },
+                            "source": transcript_state.get("interruption_source") or "user_turn",
+                        }),
+                    )
+            except Exception as exc:
+                logger.warning("Failed emitting interruption latency: %s", exc)
+
+        # 3. Conversational / greeting turn latency (fail-safe)
+        try:
+            last_user_metrics = transcript_state.get("last_user_turn_metrics") or {}
+            if agent_turn_idx == 1 and not last_user_metrics:
+                cust_join_ts = (
+                    customer_joined_at.timestamp()
+                    if customer_joined_at
+                    else (worker_saw_at.timestamp() if worker_saw_at else time.time())
+                )
+                pub_ts = started_speaking_at or time.time()
+                join_to_greeting_ms = (pub_ts - cust_join_ts) * 1000.0
+                logger.info(
+                    "[LATENCY_GREETING] %s",
+                    json.dumps({
+                        "call_id": call_id,
+                        "turn_idx": 0,
+                        "join_to_greeting_audio_ms": round(join_to_greeting_ms, 2),
+                        "started_speaking_at": pub_ts,
+                        "text": text,
+                    }),
+                )
+            elif last_user_metrics:
+                t_user_stopped = last_user_metrics.get("stopped_speaking_at")
+                transcription_delay = last_user_metrics.get("transcription_delay")
+                if t_user_stopped is not None and transcription_delay is not None:
+                    t_stt_final = t_user_stopped + transcription_delay
+                    vad_to_stt_ms = transcription_delay * 1000.0
+                else:
+                    t_stt_final = None
+                    vad_to_stt_ms = None
+
+                llm_node_ttft = metrics.get("llm_node_ttft")
+                t_llm_first_token = getattr(tracking_llm, "latest_first_token_at", None) if tracking_llm else None
+                if (
+                    t_llm_first_token is None
+                    and llm_node_ttft is not None
+                    and getattr(item, "created_at", None) is not None
+                ):
+                    t_llm_first_token = item.created_at + llm_node_ttft
+
+                if t_llm_first_token is not None and t_stt_final is not None:
+                    stt_to_llm_ms = (t_llm_first_token - t_stt_final) * 1000.0
+                elif llm_node_ttft is not None:
+                    stt_to_llm_ms = llm_node_ttft * 1000.0
+                else:
+                    stt_to_llm_ms = None
+
+                tts_node_ttfb = metrics.get("tts_node_ttfb")
+                playback_latency = metrics.get("playback_latency", 0.0)
+                t_audio_published = started_speaking_at
+
+                if t_audio_published is not None:
+                    t_tts_first_audio = t_audio_published - playback_latency
+                else:
+                    t_tts_first_audio = None
+
+                if t_tts_first_audio is not None and t_llm_first_token is not None:
+                    llm_to_tts_ms = (t_tts_first_audio - t_llm_first_token) * 1000.0
+                elif tts_node_ttfb is not None:
+                    llm_to_tts_ms = tts_node_ttfb * 1000.0
+                else:
+                    llm_to_tts_ms = None
+
+                tts_to_publish_ms = playback_latency * 1000.0 if playback_latency is not None else None
+
+                if metrics.get("e2e_latency") is not None:
+                    total_e2e_ms = metrics["e2e_latency"] * 1000.0
+                elif t_audio_published is not None and t_user_stopped is not None:
+                    total_e2e_ms = (t_audio_published - t_user_stopped) * 1000.0
+                else:
+                    total_e2e_ms = None
+
+                cum_stt = (
+                    (t_stt_final - t_user_stopped) * 1000.0
+                    if (t_stt_final is not None and t_user_stopped is not None)
+                    else None
+                )
+                cum_llm = (
+                    (t_llm_first_token - t_user_stopped) * 1000.0
+                    if (t_llm_first_token is not None and t_user_stopped is not None)
+                    else None
+                )
+                cum_tts = (
+                    (t_tts_first_audio - t_user_stopped) * 1000.0
+                    if (t_tts_first_audio is not None and t_user_stopped is not None)
+                    else None
+                )
+                cum_pub = total_e2e_ms
+
+                items_list = chat_ctx_items or []
+                whisper_in_ctx = any(
+                    (getattr(it, "extra", None) or {}).get("whisper") for it in items_list
+                )
+                preemptive_used = bool(
+                    (t_llm_first_token is not None and t_user_stopped is not None and t_llm_first_token < t_user_stopped)
+                    or (
+                        getattr(item, "created_at", None) is not None
+                        and t_user_stopped is not None
+                        and item.created_at < t_user_stopped
+                    )
+                )
+
+                logger.info(
+                    "[LATENCY] %s",
+                    json.dumps({
+                        "call_id": call_id,
+                        "turn_idx": agent_turn_idx,
+                        "timestamps": {
+                            "user_stopped": t_user_stopped,
+                            "stt_final": t_stt_final,
+                            "llm_first_token": t_llm_first_token,
+                            "tts_first_audio": t_tts_first_audio,
+                            "audio_published": t_audio_published,
+                        },
+                        "deltas_ms": {
+                            "vad_to_stt": round(vad_to_stt_ms, 2) if vad_to_stt_ms is not None else None,
+                            "stt_to_llm": round(stt_to_llm_ms, 2) if stt_to_llm_ms is not None else None,
+                            "llm_to_tts": round(llm_to_tts_ms, 2) if llm_to_tts_ms is not None else None,
+                            "tts_to_publish": round(tts_to_publish_ms, 2) if tts_to_publish_ms is not None else None,
+                        },
+                        "cumulative_ms": {
+                            "user_stopped": 0.0 if t_user_stopped is not None else None,
+                            "stt_final": round(cum_stt, 2) if cum_stt is not None else None,
+                            "llm_first_token": round(cum_llm, 2) if cum_llm is not None else None,
+                            "tts_first_audio": round(cum_tts, 2) if cum_tts is not None else None,
+                            "audio_published": round(cum_pub, 2) if cum_pub is not None else None,
+                        },
+                        "total_ms": round(total_e2e_ms, 2) if total_e2e_ms is not None else None,
+                        "flags": {
+                            "interrupted": is_interrupted,
+                            "whisper_in_ctx": whisper_in_ctx,
+                            "preemptive_used": preemptive_used,
+                        },
+                    }),
+                )
+        except Exception as exc:
+            logger.warning("Failed calculating/emitting turn latency: %s", exc)
+        finally:
+            transcript_state["last_user_turn_metrics"] = {}
 
 
 @server.rtc_session(agent_name=config.AGENT_NAME)
@@ -181,15 +446,16 @@ async def entrypoint(ctx: JobContext) -> None:
     transcript_lock = asyncio.Lock()
     pending_transcript_tasks: set[asyncio.Task[None]] = set()
 
-    agent_turn_idx = 0
-    last_user_turn_metrics: dict[str, Any] = {}
-    last_user_turn_text: str = ""
+    turn_tracking_state: dict[str, Any] = {
+        "agent_turn_idx": 0,
+        "last_user_turn_metrics": {},
+        "last_user_turn_text": "",
+        "user_speech_onset_time": None,
+        "interruption_event_time": None,
+        "interruption_source": None,
+    }
 
-    # Interruption tracking state
     active_speech_handle: Any = None
-    user_speech_onset_time: float | None = None
-    interruption_event_time: float | None = None
-    interruption_source: str | None = None
 
     def _schedule_transcript_write(coro: Any) -> None:
         task = asyncio.create_task(coro)
@@ -214,280 +480,52 @@ async def entrypoint(ctx: JobContext) -> None:
             except Exception as exc:
                 logger.error("Failed to stream transcript line: %s", exc)
 
-    # Track user speech onset for interruption latency
+    # Track user speech onset for interruption latency (fail-safe)
     @session.on("user_state_changed")
     def on_user_state_changed(ev: Any) -> None:
-        nonlocal user_speech_onset_time
-        if getattr(ev, "new_state", None) == "speaking":
-            user_speech_onset_time = getattr(ev, "created_at", None) or time.time()
+        try:
+            if getattr(ev, "new_state", None) == "speaking":
+                turn_tracking_state["user_speech_onset_time"] = getattr(ev, "created_at", None) or time.time()
+        except Exception as exc:
+            logger.warning("Failed in on_user_state_changed callback: %s", exc)
 
-    # Track speech handle creation and interruption event trigger
+    # Track speech handle creation and interruption event trigger (fail-safe)
     @session.on("speech_created")
     def on_speech_created(ev: Any) -> None:
-        nonlocal active_speech_handle, interruption_event_time, interruption_source
-        handle = getattr(ev, "speech_handle", None)
-        if handle is None:
-            return
-        active_speech_handle = handle
+        nonlocal active_speech_handle
+        try:
+            handle = getattr(ev, "speech_handle", None)
+            if handle is None:
+                return
+            active_speech_handle = handle
 
-        def _on_interrupt_done(_: Any) -> None:
-            nonlocal interruption_event_time, interruption_source
-            interruption_event_time = time.time()
-            interruption_source = getattr(handle, "_interrupt_source", "user_turn")
+            def _on_interrupt_done(_: Any) -> None:
+                try:
+                    turn_tracking_state["interruption_event_time"] = time.time()
+                    turn_tracking_state["interruption_source"] = getattr(handle, "_interrupt_source", "user_turn")
+                except Exception as exc:
+                    logger.warning("Failed in _on_interrupt_done callback: %s", exc)
 
-        if hasattr(handle, "_interrupt_fut"):
-            handle._interrupt_fut.add_done_callback(_on_interrupt_done)
+            if hasattr(handle, "_interrupt_fut"):
+                handle._interrupt_fut.add_done_callback(_on_interrupt_done)
+        except Exception as exc:
+            logger.warning("Failed in on_speech_created callback: %s", exc)
 
     # 8. Register Conversation Item Hook for Barge-in, Transcripts, and Latency
     @session.on("conversation_item_added")
     def on_conversation_item_added(ev: Any) -> None:
-        nonlocal transcript_seq, agent_turn_idx, last_user_turn_metrics, last_user_turn_text
-        nonlocal active_speech_handle, user_speech_onset_time, interruption_event_time, interruption_source
-        item = ev.item
-        now_iso = _format_iso(datetime.now(timezone.utc))
-
-        if not isinstance(item, llm.ChatMessage):
-            return
-
-        # Explicitly filter to user and assistant roles only; drop internal guidance / whispers
-        if item.role not in ("assistant", "user") or (getattr(item, "extra", None) or {}).get("whisper"):
-            return
-
-        text = item.text_content
-        metrics = getattr(item, "metrics", None) or {}
-
-        # Timing extraction:
-        # stopped_speaking_at is VAD end-of-speech (after silence window) for user turns,
-        # and playback completion/truncation time for agent turns.
-        started_speaking_at = metrics.get("started_speaking_at")
-        stopped_speaking_at = metrics.get("stopped_speaking_at")
-
-        if started_speaking_at is not None:
-            started_at_dt = datetime.fromtimestamp(started_speaking_at, tz=timezone.utc)
-        elif getattr(item, "created_at", None) is not None:
-            started_at_dt = datetime.fromtimestamp(item.created_at, tz=timezone.utc)
-        else:
-            started_at_dt = datetime.now(timezone.utc)
-
-        if stopped_speaking_at is not None:
-            ended_at_dt = datetime.fromtimestamp(stopped_speaking_at, tz=timezone.utc)
-        else:
-            ended_at_dt = datetime.now(timezone.utc)
-
-        started_at_iso = _format_iso(started_at_dt)
-        ended_at_iso = _format_iso(ended_at_dt)
-
-        if item.role == "user":
-            # Save user turn metrics for subsequent assistant turn latency correlation
-            # Note: stopped_speaking_at is VAD end-of-speech (after silence window)
-            last_user_turn_metrics = dict(metrics)
-            last_user_turn_text = text
-
-            # Record user turn with speech timing
-            _schedule_transcript_write(
-                _record_transcript_line(
-                    speaker="user",
-                    text=text,
-                    started_at=started_at_iso,
-                    ended_at=ended_at_iso,
-                )
-            )
-
-        elif item.role == "assistant":
-            agent_turn_idx += 1
-            is_interrupted = bool(getattr(item, "interrupted", False))
-
-            if is_interrupted:
-                interruption_ts = _format_iso(datetime.now(timezone.utc))
-                logger.info(
-                    "[INTERRUPTION_DEBUG] Barge-in detected at %s! "
-                    "FULL LLM generated: %r | KEPT in history/transcript: %r",
-                    interruption_ts,
-                    tracking_llm.latest_full_text,
-                    text,
-                )
-                # Requirement 5: [INTERRUPT_LATENCY]: user speech onset while agent speaking -> interruption event -> playout stop; exclude hang-up truncation.
-                if not disconnect_fut.done():
-                    t_onset = user_speech_onset_time
-                    t_event = interruption_event_time or time.time()
-                    t_stop = stopped_speaking_at or time.time()
-                    if t_onset is None:
-                        t_onset = t_event - 0.5
-                    onset_to_event_ms = (t_event - t_onset) * 1000.0
-                    event_to_stop_ms = (t_stop - t_event) * 1000.0
-                    total_interrupt_ms = (t_stop - t_onset) * 1000.0
-                    logger.info(
-                        "[INTERRUPT_LATENCY] %s",
-                        json.dumps({
-                            "call_id": call_id,
-                            "turn_idx": agent_turn_idx,
-                            "timestamps": {
-                                "user_speech_onset": t_onset,
-                                "interruption_event": t_event,
-                                "playout_stop": t_stop,
-                            },
-                            "deltas_ms": {
-                                "onset_to_event": round(onset_to_event_ms, 2),
-                                "event_to_stop": round(event_to_stop_ms, 2),
-                                "total_interruption_latency": round(total_interrupt_ms, 2),
-                            },
-                            "source": interruption_source or "user_turn",
-                        }),
-                    )
-
-            # Record assistant turn with exact playback timing
-            _schedule_transcript_write(
-                _record_transcript_line(
-                    speaker="agent",
-                    text=text,
-                    started_at=started_at_iso,
-                    ended_at=ended_at_iso,
-                )
-            )
-
-            # Check if this is the initial greeting (turn 1 with no prior user turn)
-            if agent_turn_idx == 1 and not last_user_turn_metrics:
-                cust_join_ts = (
-                    customer_participant.joined_at.timestamp()
-                    if customer_participant.joined_at
-                    else worker_saw_at.timestamp()
-                )
-                pub_ts = started_speaking_at or time.time()
-                join_to_greeting_ms = (pub_ts - cust_join_ts) * 1000.0
-                logger.info(
-                    "[LATENCY_GREETING] %s",
-                    json.dumps({
-                        "call_id": call_id,
-                        "turn_idx": 0,
-                        "join_to_greeting_audio_ms": round(join_to_greeting_ms, 2),
-                        "started_speaking_at": pub_ts,
-                        "text": text,
-                    }),
-                )
-            elif last_user_turn_metrics:
-                # Conversational turn: compute per-stage deltas and cumulative ms
-                # Stage 1: user_stopped: raw timestamp (VAD end-of-speech after silence window)
-                t_user_stopped = last_user_turn_metrics.get("stopped_speaking_at")
-
-                # Stage 2: stt_final: derived by addition (user_stopped + transcription_delay)
-                transcription_delay = last_user_turn_metrics.get("transcription_delay")
-                if t_user_stopped is not None and transcription_delay is not None:
-                    t_stt_final = t_user_stopped + transcription_delay
-                    vad_to_stt_ms = transcription_delay * 1000.0
-                else:
-                    t_stt_final = None
-                    vad_to_stt_ms = None
-
-                # Stage 3: llm_first_token: raw timestamp from TrackingLLM or duration from metrics
-                llm_node_ttft = metrics.get("llm_node_ttft")
-                t_llm_first_token = tracking_llm.latest_first_token_at
-                if (
-                    t_llm_first_token is None
-                    and llm_node_ttft is not None
-                    and getattr(item, "created_at", None) is not None
-                ):
-                    t_llm_first_token = item.created_at + llm_node_ttft
-
-                if t_llm_first_token is not None and t_stt_final is not None:
-                    stt_to_llm_ms = (t_llm_first_token - t_stt_final) * 1000.0
-                elif llm_node_ttft is not None:
-                    stt_to_llm_ms = llm_node_ttft * 1000.0
-                else:
-                    stt_to_llm_ms = None
-
-                # Stage 4: tts_first_audio: derived by subtraction (audio_published - playback_latency)
-                tts_node_ttfb = metrics.get("tts_node_ttfb")
-                playback_latency = metrics.get("playback_latency", 0.0)
-                t_audio_published = started_speaking_at
-
-                if t_audio_published is not None:
-                    t_tts_first_audio = t_audio_published - playback_latency
-                else:
-                    t_tts_first_audio = None
-
-                if t_tts_first_audio is not None and t_llm_first_token is not None:
-                    llm_to_tts_ms = (t_tts_first_audio - t_llm_first_token) * 1000.0
-                elif tts_node_ttfb is not None:
-                    llm_to_tts_ms = tts_node_ttfb * 1000.0
-                else:
-                    llm_to_tts_ms = None
-
-                # Stage 5: audio_published: raw timestamp when frame captured
-                tts_to_publish_ms = playback_latency * 1000.0 if playback_latency is not None else None
-
-                # Headline E2E Latency: user_stopped -> audio_published
-                if metrics.get("e2e_latency") is not None:
-                    total_e2e_ms = metrics["e2e_latency"] * 1000.0
-                elif t_audio_published is not None and t_user_stopped is not None:
-                    total_e2e_ms = (t_audio_published - t_user_stopped) * 1000.0
-                else:
-                    total_e2e_ms = None
-
-                # Cumulative times from user_stopped (never clamp negative deltas; log raw)
-                cum_stt = (
-                    (t_stt_final - t_user_stopped) * 1000.0
-                    if (t_stt_final is not None and t_user_stopped is not None)
-                    else None
-                )
-                cum_llm = (
-                    (t_llm_first_token - t_user_stopped) * 1000.0
-                    if (t_llm_first_token is not None and t_user_stopped is not None)
-                    else None
-                )
-                cum_tts = (
-                    (t_tts_first_audio - t_user_stopped) * 1000.0
-                    if (t_tts_first_audio is not None and t_user_stopped is not None)
-                    else None
-                )
-                cum_pub = total_e2e_ms
-
-                whisper_in_ctx = any(
-                    (getattr(it, "extra", None) or {}).get("whisper") for it in agent.chat_ctx.items
-                )
-                preemptive_used = bool(
-                    (t_llm_first_token is not None and t_user_stopped is not None and t_llm_first_token < t_user_stopped)
-                    or (
-                        getattr(item, "created_at", None) is not None
-                        and t_user_stopped is not None
-                        and item.created_at < t_user_stopped
-                    )
-                )
-
-                logger.info(
-                    "[LATENCY] %s",
-                    json.dumps({
-                        "call_id": call_id,
-                        "turn_idx": agent_turn_idx,
-                        "timestamps": {
-                            "user_stopped": t_user_stopped,
-                            "stt_final": t_stt_final,
-                            "llm_first_token": t_llm_first_token,
-                            "tts_first_audio": t_tts_first_audio,
-                            "audio_published": t_audio_published,
-                        },
-                        "deltas_ms": {
-                            "vad_to_stt": round(vad_to_stt_ms, 2) if vad_to_stt_ms is not None else None,
-                            "stt_to_llm": round(stt_to_llm_ms, 2) if stt_to_llm_ms is not None else None,
-                            "llm_to_tts": round(llm_to_tts_ms, 2) if llm_to_tts_ms is not None else None,
-                            "tts_to_publish": round(tts_to_publish_ms, 2) if tts_to_publish_ms is not None else None,
-                        },
-                        "cumulative_ms": {
-                            "user_stopped": 0.0 if t_user_stopped is not None else None,
-                            "stt_final": round(cum_stt, 2) if cum_stt is not None else None,
-                            "llm_first_token": round(cum_llm, 2) if cum_llm is not None else None,
-                            "tts_first_audio": round(cum_tts, 2) if cum_tts is not None else None,
-                            "audio_published": round(cum_pub, 2) if cum_pub is not None else None,
-                        },
-                        "total_ms": round(total_e2e_ms, 2) if total_e2e_ms is not None else None,
-                        "flags": {
-                            "interrupted": is_interrupted,
-                            "whisper_in_ctx": whisper_in_ctx,
-                            "preemptive_used": preemptive_used,
-                        },
-                    }),
-                )
-                # Reset user metrics after correlating
-                last_user_turn_metrics = {}
+        handle_conversation_item(
+            ev.item,
+            call_id=call_id,
+            transcript_state=turn_tracking_state,
+            schedule_transcript_write=_schedule_transcript_write,
+            record_transcript_line=_record_transcript_line,
+            tracking_llm=tracking_llm,
+            disconnect_fut=disconnect_fut,
+            customer_joined_at=customer_participant.joined_at,
+            worker_saw_at=worker_saw_at,
+            chat_ctx_items=agent.chat_ctx.items,
+        )
 
     # 9. Link Session Exclusively to Customer Participant
     # WHY participant_identity: Ensures the agent's STT and VAD are bound strictly to customer audio,
